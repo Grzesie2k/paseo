@@ -3553,6 +3553,7 @@ describe("ForgeService", () => {
     const runner = createScriptedRunner([
       JSON.stringify(other),
       JSON.stringify(crowd),
+      JSON.stringify({ full_name: "same/wanted" }),
       JSON.stringify({ owner: { login: "base" }, name: "project", parent: null }),
       JSON.stringify([{ number: 42, state: "open", head: { repo: { full_name: "same/wanted" } } }]),
       wanted,
@@ -3878,6 +3879,80 @@ describe("ForgeService", () => {
         headRepositoryPath: "old-fork/repo",
       }),
     ).toMatchObject({ number: 42 });
+  });
+
+  it("finds a transferred fork when the branch candidate window is full", async () => {
+    const pr = JSON.parse(
+      currentPullRequestJson({
+        url: "https://github.com/base/repo/pull/42",
+        headRepositoryOwner: { login: "new-fork" },
+        headRepository: { name: "repo" },
+      }),
+    );
+    const unrelated = Array.from({ length: 9 }, (_, i) => ({
+      ...pr,
+      number: i + 50,
+      headRepositoryOwner: { login: "other" },
+    }));
+    const runner = createScriptedRunner([
+      JSON.stringify(pr),
+      JSON.stringify([...unrelated, pr]),
+      JSON.stringify({ full_name: "new-fork/repo" }),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "feature/fork",
+        headRepositoryOwner: "old-fork",
+        headRepositoryPath: "old-fork/repo",
+      }),
+    ).toMatchObject({ number: 42, state: "open" });
+  });
+
+  it("uses the canonical fork in the bounded terminal fallback after a transfer", async () => {
+    const pr = JSON.parse(
+      currentPullRequestJson({
+        url: "https://github.com/base/repo/pull/42",
+        state: "MERGED",
+        mergedAt: "2026-01-01T00:00:00Z",
+        headRepositoryOwner: { login: "new-fork" },
+        headRepository: { name: "repo" },
+      }),
+    );
+    const unrelated = Array.from({ length: 9 }, (_, i) => ({
+      ...pr,
+      number: i + 50,
+      headRepositoryOwner: { login: "other" },
+    }));
+    const runner = createScriptedRunner([
+      JSON.stringify(pr),
+      JSON.stringify([...unrelated, pr]),
+      JSON.stringify({ full_name: "new-fork/repo" }),
+      JSON.stringify({ owner: { login: "base" }, name: "repo", parent: null }),
+      JSON.stringify([
+        { number: 42, state: "closed", head: { repo: { full_name: "new-fork/repo" } } },
+      ]),
+      JSON.stringify(pr),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "feature/fork",
+        headRepositoryOwner: "old-fork",
+        headRepositoryPath: "old-fork/repo",
+      }),
+    ).toMatchObject({ number: 42, state: "merged" });
+    expect(
+      runner.calls.some((call) => call.args[1]?.includes("head=new-fork%3Afeature%2Ffork")),
+    ).toBe(true);
   });
 
   it("propagates a failed fork PR lookup instead of reporting no pull request", async () => {

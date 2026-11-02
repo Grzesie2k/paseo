@@ -3149,9 +3149,6 @@ async function resolveListedPullRequest(
     headRef: options.headRef,
     run: options.run,
   });
-  if (candidates.length >= BATCH_PR_CANDIDATE_LIMIT && options.headRepositoryPath) {
-    return resolveCrowdedPullRequests(options, options.headRepositoryPath);
-  }
   let match = pickPullRequestCandidate({
     candidates: viewMatch ? [viewMatch, ...candidates] : candidates,
     headRef: options.headRef,
@@ -3175,6 +3172,11 @@ async function resolveListedPullRequest(
       repository.full_name &&
       repository.full_name.toLowerCase() !== options.headRepositoryPath.toLowerCase()
     ) {
+      options = {
+        ...options,
+        headRepositoryPath: repository.full_name,
+        headRepositoryOwner: repository.full_name.split("/")[0],
+      };
       match = pickPullRequestCandidate({
         candidates: viewMatch ? [viewMatch, ...candidates] : candidates,
         headRef: options.headRef,
@@ -3182,6 +3184,10 @@ async function resolveListedPullRequest(
         headRepositoryPath: repository.full_name,
       });
     }
+  }
+  if (candidates.length >= BATCH_PR_CANDIDATE_LIMIT && options.headRepositoryPath) {
+    if (match?.status.state === "open") return match.status;
+    return resolveCrowdedPullRequests(options, options.headRepositoryPath);
   }
   return match?.status ?? null;
 }
