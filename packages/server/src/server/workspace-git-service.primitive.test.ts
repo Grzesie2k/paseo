@@ -150,6 +150,8 @@ function currentPullRequestJson(overrides: Record<string, unknown> = {}): string
     isDraft: false,
     baseRefName: "main",
     headRefName: "feature",
+    headRepositoryOwner: { login: "acme" },
+    headRepository: { name: "repo" },
     mergedAt: null,
     statusCheckRollup: [],
     reviewDecision: "REVIEW_REQUIRED",
@@ -802,6 +804,28 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     service.dispose();
   });
 
+  test("an after-in-flight read refreshes again after an earlier forced read", async () => {
+    const forcedRefresh = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi
+      .fn<() => Promise<CheckoutStatusGit>>()
+      .mockImplementationOnce(async () => createCheckoutStatus(REPO_CWD))
+      .mockImplementationOnce(async () => forcedRefresh.promise)
+      .mockImplementationOnce(async () => createCheckoutStatus(REPO_CWD));
+    const service = createService({ getCheckoutStatus });
+    await service.getSnapshot(REPO_CWD);
+    const first = service.getSnapshot(REPO_CWD, { force: true, reason: "earlier" });
+    await flushPromises();
+    const second = service.getSnapshot(REPO_CWD, {
+      force: true,
+      afterInFlight: true,
+      reason: "archive",
+    });
+    forcedRefresh.resolve(createCheckoutStatus(REPO_CWD));
+    await Promise.all([first, second]);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(3);
+    service.dispose();
+  });
+
   test("a forced GitHub-inclusive call during an in-flight forced git refresh queues a GitHub refresh", async () => {
     const forcedGitRefresh = createDeferred<CheckoutStatusGit>();
     const getCheckoutStatus = vi
@@ -852,7 +876,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(getPullRequestStatus).toHaveBeenCalledWith(
       REPO_CWD,
       expect.anything(),
-      { force: true, reason: "merge-pr-validation" },
+      { force: true, reason: "merge-pr-validation", previousPullRequest: null },
       expect.anything(),
     );
 
@@ -942,7 +966,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(getPullRequestStatus).toHaveBeenCalledWith(
       REPO_CWD,
       expect.anything(),
-      { force: false, reason: "initial" },
+      { force: false, reason: "initial", previousPullRequest: null },
       expect.anything(),
     );
 
@@ -1274,6 +1298,14 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const service = createService({
       getCheckoutSnapshotFacts,
       getCheckoutStatus,
+      getPullRequestStatus: vi.fn(async () => ({
+        ...createPullRequestStatusResult(),
+        status: {
+          ...createPullRequestStatusResult().status!,
+          number: 2,
+          url: "https://forge-self-heal.test/acme/repo/pulls/2",
+        },
+      })),
     });
     const listener = vi.fn();
 
@@ -1288,6 +1320,11 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
         cwd: REPO_CWD,
         headRef: "feature",
         headSha: "1111111111111111111111111111111111111111",
+        previousPullRequest: {
+          number: 2,
+          url: "https://forge-self-heal.test/acme/repo/pulls/2",
+          state: "open",
+        },
         reason: "self-heal-forge-pr-status",
       });
       expect(listener).toHaveBeenCalledWith(
@@ -1307,6 +1344,176 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       unregister();
     }
   });
+
+  test.each(["poll then refresh", "refresh then poll"] as const)(
+    "uses the current workspace association across %s",
+    async (direction) => {
+      const merged = createCurrentPullRequestStatus({
+        number: 1,
+        url: "https://forge-owner.test/acme/repo/pulls/1",
+        state: "merged",
+        isMerged: true,
+      });
+      const open = createCurrentPullRequestStatus({
+        number: 2,
+        url: "https://forge-owner.test/acme/repo/pulls/2",
+        state: "open",
+      });
+      let refreshFindsOpen = false;
+      const forge = {
+        ...createGitHubServiceStub(),
+        retainCurrentPullRequestStatusPoll: undefined,
+        getCurrentPullRequestStatus: vi.fn(async (input) =>
+          direction === "poll then refresh" || input.previousPullRequest?.number === 2
+            ? open
+            : merged,
+        ),
+      };
+      const unregister = defaultForgeRegistry.register("forge-owner-test", {
+        createService: () => forge,
+        matchesHost: (host) => host === "forge-owner.test",
+      });
+      const getPullRequestStatus = vi.fn(async (_cwd, _forge, options) => ({
+        ...createPullRequestStatusResult(),
+        status: refreshFindsOpen || options.previousPullRequest?.number === 2 ? open : merged,
+      }));
+      const service = createService({
+        getCheckoutSnapshotFacts: vi.fn(async (cwd) =>
+          createCheckoutFacts(cwd, {
+            currentBranch: "feature",
+            remoteUrl: "https://forge-owner.test/acme/repo.git",
+            pullRequestLookupTarget: { headRef: "feature" },
+          }),
+        ),
+        getCheckoutStatus: vi.fn(async (cwd) =>
+          createCheckoutStatus(cwd, {
+            currentBranch: "feature",
+            remoteUrl: "https://forge-owner.test/acme/repo.git",
+          }),
+        ),
+        getPullRequestStatus,
+      });
+      try {
+        expect((await service.getSnapshot(REPO_CWD)).forge.pullRequest?.number).toBe(1);
+        const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+        await flushPromises();
+        if (direction === "poll then refresh") {
+          await vi.advanceTimersByTimeAsync(120_000);
+          await flushPromises();
+          expect((await service.getSnapshot(REPO_CWD)).forge.pullRequest?.number).toBe(2);
+          expect(
+            (await service.getSnapshot(REPO_CWD, { force: true, reason: "test" })).forge.pullRequest
+              ?.number,
+          ).toBe(2);
+        } else {
+          refreshFindsOpen = true;
+          expect(
+            (await service.getSnapshot(REPO_CWD, { force: true, reason: "test" })).forge.pullRequest
+              ?.number,
+          ).toBe(2);
+          refreshFindsOpen = false;
+          await vi.advanceTimersByTimeAsync(120_000);
+          await flushPromises();
+          expect((await service.getSnapshot(REPO_CWD)).forge.pullRequest?.number).toBe(2);
+        }
+        subscription.unsubscribe();
+      } finally {
+        service.dispose();
+        unregister();
+      }
+    },
+  );
+
+  test.each(["older poll", "older refresh"] as const)(
+    "does not publish an %s after a newer observation",
+    async (older) => {
+      const merged = createCurrentPullRequestStatus({
+        number: 1,
+        url: "https://forge-race.test/acme/repo/pulls/1",
+        state: "merged",
+        isMerged: true,
+      });
+      const open = createCurrentPullRequestStatus({
+        number: 2,
+        url: "https://forge-race.test/acme/repo/pulls/2",
+        state: "open",
+      });
+      const delayedPoll = createDeferred<CurrentPullRequestStatus | null>();
+      const delayedRefresh = createDeferred<PullRequestStatusResult>();
+      let delayRefresh = false;
+      const forge = {
+        ...createGitHubServiceStub(),
+        retainCurrentPullRequestStatusPoll: undefined,
+        getCurrentPullRequestStatus: vi.fn(async () =>
+          older === "older poll" ? delayedPoll.promise : open,
+        ),
+      };
+      const unregister = defaultForgeRegistry.register("forge-race-test", {
+        createService: () => forge,
+        matchesHost: (host) => host === "forge-race.test",
+      });
+      let first = true;
+      const getPullRequestStatus = vi.fn(async (_cwd, _forge, options) => {
+        if (first) {
+          first = false;
+          return { ...createPullRequestStatusResult(), status: merged };
+        }
+        if (delayRefresh) {
+          delayRefresh = false;
+          return delayedRefresh.promise;
+        }
+        return {
+          ...createPullRequestStatusResult(),
+          status:
+            older === "older poll" || options.previousPullRequest?.number === 2 ? open : merged,
+        };
+      });
+      const service = createService({
+        getCheckoutSnapshotFacts: vi.fn(async (cwd) =>
+          createCheckoutFacts(cwd, {
+            currentBranch: "feature",
+            remoteUrl: "https://forge-race.test/acme/repo.git",
+            pullRequestLookupTarget: { headRef: "feature" },
+          }),
+        ),
+        getCheckoutStatus: vi.fn(async (cwd) =>
+          createCheckoutStatus(cwd, {
+            currentBranch: "feature",
+            remoteUrl: "https://forge-race.test/acme/repo.git",
+          }),
+        ),
+        getPullRequestStatus,
+      });
+      try {
+        await service.getSnapshot(REPO_CWD);
+        const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+        await flushPromises();
+        if (older === "older poll") {
+          await vi.advanceTimersByTimeAsync(120_000);
+          await flushPromises();
+          expect(
+            (await service.getSnapshot(REPO_CWD, { force: true, reason: "test" })).forge.pullRequest
+              ?.number,
+          ).toBe(2);
+          delayedPoll.resolve(merged);
+          await flushPromises();
+        } else {
+          delayRefresh = true;
+          const refresh = service.getSnapshot(REPO_CWD, { force: true, reason: "test" });
+          await flushPromises();
+          await vi.advanceTimersByTimeAsync(120_000);
+          await flushPromises();
+          delayedRefresh.resolve({ ...createPullRequestStatusResult(), status: merged });
+          expect((await refresh).forge.pullRequest?.number).toBe(2);
+        }
+        expect((await service.getSnapshot(REPO_CWD)).forge.pullRequest?.number).toBe(2);
+        subscription.unsubscribe();
+      } finally {
+        service.dispose();
+        unregister();
+      }
+    },
+  );
 
   test("generic forge self-heal uses the fast poll window while checks are pending", async () => {
     const forge = {

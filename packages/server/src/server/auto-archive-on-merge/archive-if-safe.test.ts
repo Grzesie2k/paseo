@@ -14,6 +14,8 @@ import {
 import type { ArchiveResult, ActiveWorkspaceRef } from "../workspace-archive-service.js";
 import type { WorkspaceGitRuntimeSnapshot } from "../workspace-git-service.js";
 import { createWorktree, type WorktreeConfig } from "../../utils/worktree.js";
+import { createGitLabService } from "../../services/gitlab-service.js";
+import { createGiteaService } from "../../services/gitea-service.js";
 import type { ForgeService } from "../../../services/forge-service.js";
 import type { StoredAgentRecord } from "../agent/agent-storage.js";
 
@@ -30,6 +32,7 @@ function createPullRequest(
     state: "open",
     baseRefName: "main",
     headRefName: "feature",
+    headSha: "same-head",
     isMerged: true,
     ...overrides,
   };
@@ -46,6 +49,8 @@ function createSnapshot(overrides?: {
       repoRoot: "/tmp/repo",
       mainRepoRoot: "/tmp/repo",
       currentBranch: "feature",
+      upstreamKnown: true,
+      headSha: "same-head",
       remoteUrl: "https://github.com/acme/repo.git",
       isPaseoOwnedWorktree: true,
       isDirty: false,
@@ -346,6 +351,89 @@ afterEach(() => {
 });
 
 describe("archiveIfSafe", () => {
+  test("archives an exact-head GitLab merge using the adapter status", async () => {
+    const mr = {
+      iid: 123,
+      title: "Merge me",
+      web_url: "https://gitlab.example.com/acme/repo/-/merge_requests/123",
+      state: "merged",
+      source_branch: "feature",
+      target_branch: "main",
+      source_project_id: 1,
+      target_project_id: 1,
+      sha: "same-head",
+      references: { full: "acme/repo!123" },
+    };
+    const forge = createGitLabService({
+      resolveGlabPath: async () => "/test/glab",
+      resolveRemoteUrl: async () => "https://gitlab.example.com/acme/repo.git",
+      runner: async (args) => ({
+        stdout: JSON.stringify(args[1] === "list" ? [mr] : mr),
+        stderr: "",
+      }),
+    });
+    const status = await forge.getCurrentPullRequestStatus({ cwd: CWD, headRef: "feature" });
+    expect(status).toMatchObject({ isMerged: true, headSha: "same-head" });
+    const harness = createHarness({ snapshot: createSnapshot({ pullRequest: status }) });
+    await runArchiveIfSafe(harness);
+    expect(harness.deps.archiveByScope).toHaveBeenCalledTimes(1);
+  });
+
+  test("archives a Gitea merge when optional checks fail but selected head is known", async () => {
+    const pr = {
+      number: 123,
+      html_url: "https://gitea.com/acme/repo/pulls/123",
+      title: "Merge me",
+      state: "closed",
+      merged: true,
+      head: {
+        ref: "feature",
+        sha: "same-head",
+        repo: { id: 1, full_name: "acme/repo", owner: { login: "acme" } },
+      },
+      base: { ref: "main", repo: { id: 1, owner: { login: "acme" } } },
+    };
+    const forge = createGiteaService({
+      resolveTeaPath: async () => "/test/tea",
+      resolveRemoteUrl: async () => "https://gitea.com/acme/repo.git",
+      runner: async (args) => {
+        if (args[0] === "pr" && args[1] === "list") return { stdout: "[]", stderr: "" };
+        if (args[0] === "api" && args[1].includes("/pulls?"))
+          return { stdout: JSON.stringify([pr]), stderr: "" };
+        throw new Error("checks unavailable");
+      },
+    });
+    const status = await forge.getCurrentPullRequestStatus({ cwd: CWD, headRef: "feature" });
+    expect(status).toMatchObject({ isMerged: true, headSha: "same-head" });
+    const harness = createHarness({ snapshot: createSnapshot({ pullRequest: status }) });
+    await runArchiveIfSafe(harness);
+    expect(harness.deps.archiveByScope).toHaveBeenCalledTimes(1);
+  });
+  test("does not archive when the checkout and merged PR heads differ", async () => {
+    const harness = createHarness({
+      snapshot: createSnapshot({
+        git: { headSha: "checkout-head" } as Partial<WorkspaceGitRuntimeSnapshot["git"]>,
+        pullRequest: createPullRequest({ headSha: "remote-head" } as Partial<
+          NonNullable<WorkspaceGitRuntimeSnapshot["forge"]["pullRequest"]>
+        >),
+      }),
+    });
+
+    await runArchiveIfSafe(harness);
+
+    expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+  });
+  test("does not archive when either head or the worktree state is unavailable", async () => {
+    for (const snapshot of [
+      createSnapshot({ git: { headSha: undefined } }),
+      createSnapshot({ pullRequest: createPullRequest({ headSha: undefined }) }),
+      createSnapshot({ git: { isDirty: null } }),
+    ]) {
+      const harness = createHarness({ snapshot });
+      await runArchiveIfSafe(harness);
+      expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+    }
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -378,6 +466,26 @@ describe("archiveIfSafe", () => {
     await runArchiveIfSafe(harness);
 
     expect(harness.deps.isPaseoOwnedWorktreeCwd).not.toHaveBeenCalled();
+    expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+  });
+
+  test("does not archive when the upstream lookup failed", async () => {
+    const harness = createHarness({
+      snapshot: createSnapshot({
+        git: { aheadOfOrigin: null, upstreamKnown: false } as Partial<
+          WorkspaceGitRuntimeSnapshot["git"]
+        >,
+      }),
+    });
+    await runArchiveIfSafe(harness);
+    expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+  });
+
+  test("does not archive when upstream safety provenance is missing", async () => {
+    const harness = createHarness({
+      snapshot: createSnapshot({ git: { aheadOfOrigin: 0, upstreamKnown: undefined } }),
+    });
+    await runArchiveIfSafe(harness);
     expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
   });
 

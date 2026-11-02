@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PullRequestCommandStatus, PullRequestTimelineItem } from "./forge-service.js";
+import { ForgeDiscoveryIncompleteError } from "./forge-service.js";
 import {
   type CreateGiteaServiceOptions,
   createGiteaService,
@@ -19,9 +20,38 @@ function ok(stdout: string): TeaCommandResult {
 
 function makeService(responder: Responder, overrides: Partial<CreateGiteaServiceOptions> = {}) {
   const calls: string[][] = [];
+  const listed = new Map<string, typeof OPEN_PR>();
+  const listedDetail = (args: string[]): TeaCommandResult | null => {
+    const match = args[0] === "api" ? args[1]?.match(/\/pulls\/(\d+)$/) : null;
+    const item = match ? listed.get(match[1]) : undefined;
+    if (!item) return null;
+    const detail = currentPullRequestApi({
+      number: Number(item.index),
+      state: "open",
+      headRef: item.head,
+      headSha: STATUS_PR_VIEW.headSha,
+    });
+    return ok(JSON.stringify({ ...detail, html_url: item.url, title: item.title }));
+  };
   const runner: TeaCommandRunner = async (args) => {
     calls.push(args);
-    return responder(args);
+    try {
+      const result = await responder(args);
+      if (args[0] === "pr" && args[1] === "list") {
+        const items = JSON.parse(result.stdout);
+        if (Array.isArray(items)) for (const item of items) listed.set(item.index, item);
+      }
+      if (args[0] === "api" && /\/pulls\/\d+$/.test(args[1] ?? "")) {
+        const data = JSON.parse(result.stdout);
+        if (!data?.number) return listedDetail(args) ?? result;
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("unexpected call:")) {
+        return listedDetail(args) ?? Promise.reject(error);
+      }
+      throw error;
+    }
   };
   const service = createGiteaService({
     runner,
@@ -94,7 +124,7 @@ function currentPullRequestApi(input: {
     head: {
       ref: input.headRef,
       sha: input.headSha,
-      repo: { id: 1, owner: { login: "example-user" } },
+      repo: { id: 1, full_name: "example-user/sample-repo", owner: { login: "example-user" } },
     },
     base: {
       ref: "main",
@@ -485,8 +515,9 @@ describe("createGiteaService", () => {
     expect(calls[0]).toContain("--fields");
     expect(calls[0]).toContain("-o");
     expect(calls[0]).toContain("json");
-    expect(calls[1]).toEqual(["pr", "5", "-o", "json"]);
-    expect(calls[2]).toEqual([
+    expect(calls[1]).toEqual(["api", "repos/example-user/sample-repo/pulls/5"]);
+    expect(calls[2]).toEqual(["pr", "5", "-o", "json"]);
+    expect(calls[3]).toEqual([
       "api",
       "repos/example-user/sample-repo/commits/3333333333333333333333333333333333333333/status",
     ]);
@@ -1627,6 +1658,7 @@ describe("createGiteaService", () => {
         "--page",
         "1",
       ],
+      ["api", "repos/example-user/sample-repo/pulls/5"],
       ["pr", "5", "-o", "json"],
       ["api", `repos/example-user/sample-repo/commits/${STATUS_PR_VIEW.headSha}/status`],
     ]);
@@ -2055,6 +2087,7 @@ describe("createGiteaService", () => {
       cwd: "/repo",
       headRef: "feat/recently-closed",
       headSha,
+      headRepositoryPath: "example-user/sample-repo",
     });
 
     expect(status).toMatchObject({ number: 8, headRefName: "feat/recently-closed" });
@@ -2064,7 +2097,7 @@ describe("createGiteaService", () => {
     ]);
   });
 
-  it("does not attach a stale Gitea-family PR after a same-name branch advances", async () => {
+  it("shows a merged PR when the checkout head differs", async () => {
     const stale = currentPullRequestApi({
       number: 8,
       state: "closed",
@@ -2086,7 +2119,336 @@ describe("createGiteaService", () => {
         headRef: "dev",
         headSha: "2222222222222222222222222222222222222222",
       }),
+    ).resolves.toMatchObject({ number: 8, state: "merged", headSha: stale.head.sha });
+  });
+
+  it("does not scan beyond the bounded terminal window", async () => {
+    const unrelated = Array.from({ length: 50 }, (_, i) =>
+      currentPullRequestApi({
+        number: i + 100,
+        state: "closed",
+        headRef: `other-${i}`,
+        headSha: "1".repeat(40),
+      }),
+    );
+    const wanted = currentPullRequestApi({
+      number: 8,
+      state: "closed",
+      headRef: "topic",
+      headSha: "2".repeat(40),
+      merged: true,
+    });
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok("[]");
+      if (args[0] === "api" && args[1].includes("/pulls?state=all"))
+        return ok(JSON.stringify(args[1].includes("page=2") ? [wanted] : unrelated));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
+    expect(calls.filter((args) => args[1]?.includes("/pulls?state=all"))).toHaveLength(1);
+  });
+
+  it("does not associate a different repository owned by the same account", async () => {
+    const foreign = currentPullRequestApi({
+      number: 8,
+      state: "closed",
+      headRef: "dev",
+      headSha: "1".repeat(40),
+      merged: true,
+    });
+    foreign.head.repo.id = 2;
+    foreign.head.repo.full_name = "example-user/other";
+    const { service } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok("[]");
+      if (args[0] === "api" && args[1].includes("/pulls?state=all"))
+        return ok(JSON.stringify([foreign]));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "dev" }),
     ).resolves.toBeNull();
+  });
+
+  it.each(["merged", "open"] as const)(
+    "finds a recent %s candidate after 200 unrelated open requests",
+    async (state) => {
+      const unrelated = Array.from({ length: 50 }, (_, i) => ({
+        ...OPEN_PR,
+        index: String(i + 100),
+        head: `other-${i}`,
+      }));
+      const wanted = currentPullRequestApi({
+        number: 9,
+        state: state === "merged" ? "closed" : "open",
+        headRef: "topic",
+        headSha: "1".repeat(40),
+        merged: state === "merged",
+      });
+      const newerMerged = currentPullRequestApi({
+        number: 10,
+        state: "closed",
+        headRef: "topic",
+        headSha: "2".repeat(40),
+        merged: true,
+      });
+      const { service, calls } = makeService((args) => {
+        if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify(unrelated));
+        if (args[0] === "api" && args[1].includes("pulls?state=all"))
+          return ok(
+            JSON.stringify(
+              state === "open"
+                ? [
+                    { ...newerMerged, updated_at: "2026-10-01T00:00:00Z" },
+                    { ...wanted, updated_at: "2026-01-01T00:00:00Z" },
+                  ]
+                : [wanted],
+            ),
+          );
+        if (args[0] === "pr" && args[1] === "9") return ok(JSON.stringify(STATUS_PR_VIEW));
+        if (args[0] === "api" && args[1].includes("/commits/"))
+          return ok(JSON.stringify({ state: "", statuses: [] }));
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      });
+      expect(
+        (await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }))?.number,
+      ).toBe(9);
+      expect(calls.filter((args) => args[0] === "pr" && args[1] === "list")).toHaveLength(4);
+      expect(calls.filter((args) => args[1]?.includes("pulls?state=all"))).toHaveLength(1);
+    },
+  );
+
+  it("revalidates a known open PR before replacing it with a crowded-window terminal candidate", async () => {
+    const open = currentPullRequestApi({
+      number: 2,
+      state: "open",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+    });
+    const oldMerged = currentPullRequestApi({
+      number: 1,
+      state: "closed",
+      headRef: "topic",
+      headSha: "2".repeat(40),
+      merged: true,
+    });
+    const unrelated = Array.from({ length: 50 }, (_, i) => ({
+      ...OPEN_PR,
+      index: String(i + 100),
+      head: `other-${i}`,
+    }));
+    const fullRecentItems = Array.from({ length: 50 }, (_, i) => ({
+      ...oldMerged,
+      number: i + 100,
+      head: { ...oldMerged.head, ref: `other-${i}` },
+    }));
+    let crowded = false;
+    let fullRecent = false;
+    let prior = open;
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list")
+        return ok(
+          JSON.stringify(
+            crowded ? unrelated : [{ ...OPEN_PR, index: "2", url: open.html_url, head: "topic" }],
+          ),
+        );
+      if (args[0] === "api" && args[1].endsWith("/pulls/2")) return ok(JSON.stringify(prior));
+      if (args[0] === "api" && args[1].includes("pulls?state=all"))
+        return ok(JSON.stringify(fullRecent ? fullRecentItems : [oldMerged]));
+      if (args[0] === "pr" && args[1] === "2") return ok(JSON.stringify(STATUS_PR_VIEW));
+      if (args[0] === "api" && args[1].includes("/commits/"))
+        return ok(JSON.stringify({ state: "", statuses: [] }));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const input = { cwd: "/repo", headRef: "topic" };
+    const observed = await service.getCurrentPullRequestStatus(input);
+    expect(observed).toMatchObject({ number: 2, state: "open" });
+    crowded = true;
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, previousPullRequest: observed! }),
+    ).toMatchObject({ number: 2, state: "open" });
+    prior = { ...open, state: "closed", merged: true };
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, previousPullRequest: observed! }),
+    ).toMatchObject({ number: 2, state: "merged" });
+    prior = { ...open, state: "closed", merged: false };
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, previousPullRequest: observed! }),
+    ).toMatchObject({ number: 2, state: "closed" });
+    fullRecent = true;
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, previousPullRequest: observed! }),
+    ).toMatchObject({ number: 2, state: "closed" });
+    expect(calls.filter((args) => args[1]?.endsWith("/pulls/2"))).toHaveLength(5);
+  });
+
+  it("requires candidate clone URL proof for mixed ports and isolates cached identity", async () => {
+    const pr = currentPullRequestApi({
+      number: 5,
+      state: "open",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+    });
+    let cloneUrl: string | undefined = "ssh://git@forge.example:2222/example-user/sample-repo.git";
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list")
+        return ok(JSON.stringify([{ ...OPEN_PR, head: "topic" }]));
+      if (args[0] === "api" && args[1].endsWith("/pulls/5"))
+        return ok(
+          JSON.stringify({
+            ...pr,
+            head: { ...pr.head, repo: { ...pr.head.repo, ssh_url: cloneUrl } },
+          }),
+        );
+      if (args[0] === "api" && args[1].includes("pulls?state=all")) return ok("[]");
+      if (args[0] === "pr" && args[1] === "5") return ok(JSON.stringify(STATUS_PR_VIEW));
+      if (args[0] === "api" && args[1].includes("/commits/"))
+        return ok(JSON.stringify({ state: "", statuses: [] }));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const endpoint = {
+      transport: "ssh" as const,
+      host: "forge.example",
+      port: "2222",
+      path: "example-user/sample-repo",
+    };
+    const input = { cwd: "/repo", headRef: "topic", headRepositoryEndpoint: endpoint };
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(5);
+    expect(
+      await service.getCurrentPullRequestStatus({
+        ...input,
+        headRepositoryEndpoint: { ...endpoint, port: "2223" },
+      }),
+    ).toBeNull();
+    expect(
+      (await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" }))
+        ?.number,
+    ).toBe(5);
+    cloneUrl = undefined;
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" }),
+    ).toBeNull();
+    expect(calls.filter((args) => args[1]?.endsWith("/pulls/5"))).toHaveLength(4);
+  });
+
+  it("ignores an open PR from another repository of the same owner", async () => {
+    const foreign = currentPullRequestApi({
+      number: 5,
+      state: "open",
+      headRef: "dev",
+      headSha: "1".repeat(40),
+    });
+    foreign.head.repo.id = 2;
+    foreign.head.repo.full_name = "example-user/other";
+    const { service } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list")
+        return ok(JSON.stringify([{ ...OPEN_PR, head: "dev" }]));
+      if (args[0] === "api" && args[1].endsWith("/pulls/5")) return ok(JSON.stringify(foreign));
+      if (args[0] === "api" && args[1].includes("/pulls?state=all")) return ok("[]");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "dev",
+        headRepositoryPath: "example-user/sample-repo",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("uses a checkout hint to discover a renamed fork before finding the current PR", async () => {
+    const forkPr = currentPullRequestApi({
+      number: 42,
+      state: "open",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+    });
+    forkPr.head.repo = { id: 2, full_name: "contributor/renamed", owner: { login: "contributor" } };
+    const { service } = makeService((args) => {
+      if (args[0] === "api" && args[1].endsWith("/pulls/41"))
+        return ok(JSON.stringify({ ...forkPr, number: 41 }));
+      if (args[0] === "pr" && args[1] === "list") return ok("[]");
+      if (args[0] === "api" && args[1].includes("/pulls?state=all"))
+        return ok(JSON.stringify([forkPr]));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const status = await service.getCurrentPullRequestStatus({
+      cwd: "/repo",
+      headRef: "topic",
+      headRepositoryOwner: "contributor",
+      changeRequestNumber: 41,
+    });
+    expect(status?.number).toBe(42);
+  });
+
+  it("prefers an open PR before looking for terminal requests", async () => {
+    const open = { ...OPEN_PR, head: "topic" };
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify([open]));
+      if (args[0] === "pr" && args[1] === "5") return ok(JSON.stringify(STATUS_PR_VIEW));
+      if (args[0] === "api" && args[1].includes("/commits/"))
+        return ok(JSON.stringify({ state: "", statuses: [] }));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).toMatchObject({ number: 5, state: "open" });
+    expect(calls.some((args) => args[1]?.includes("pulls?state=all"))).toBe(false);
+  });
+
+  it("bounds repository identity reads when a branch is crowded", async () => {
+    const candidates = Array.from({ length: 4 }, (_, i) => ({
+      ...OPEN_PR,
+      index: String(i + 20),
+      head: "topic",
+    }));
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify(candidates));
+      if (args[0] === "api" && args[1].includes("pulls?state=all")) return ok("[]");
+      if (args[0] === "api" && /\/pulls\/\d+$/.test(args[1])) {
+        const pr = currentPullRequestApi({
+          number: Number(args[1].split("/").at(-1)),
+          state: "open",
+          headRef: "topic",
+          headSha: "1".repeat(40),
+        });
+        pr.head.repo.full_name = "example-user/other";
+        return ok(JSON.stringify(pr));
+      }
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
+    expect(calls.filter((args) => args[0] === "api" && /\/pulls\/\d+$/.test(args[1]))).toHaveLength(
+      3,
+    );
+  });
+
+  it("reuses the head repository identity on subsequent open PR polls", async () => {
+    const open = { ...OPEN_PR, head: "topic" };
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify([open]));
+      if (args[0] === "pr" && args[1] === "5") return ok(JSON.stringify(STATUS_PR_VIEW));
+      if (args[0] === "api" && args[1].includes("/commits/"))
+        return ok(JSON.stringify({ state: "", statuses: [] }));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const input = { cwd: "/repo", headRef: "topic" };
+    expect((await service.getCurrentPullRequestStatus(input))?.headSha).toBe(
+      STATUS_PR_VIEW.headSha,
+    );
+    expect((await service.getCurrentPullRequestStatus(input))?.headSha).toBe(
+      STATUS_PR_VIEW.headSha,
+    );
+    expect(
+      calls.filter((args) => args[1] === "repos/example-user/sample-repo/pulls/5"),
+    ).toHaveLength(1);
+    await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" });
+    expect(
+      calls.filter((args) => args[1] === "repos/example-user/sample-repo/pulls/5"),
+    ).toHaveLength(2);
   });
 
   it("returns null when no PR matches the current branch", async () => {
@@ -2110,11 +2472,7 @@ describe("createGiteaService", () => {
     ]);
   });
 
-  it("resolves an open cross-fork PR by head sha despite the owner gate", async () => {
-    // The PR lives in the base repo but its head is on a fork
-    // (contributor:feat/fork-change), so the checkout-owner gate excludes it.
-    // The head sha uniquely identifies it, so resolution must accept it — this
-    // mirrors GitLab, which resolves fork MRs from the base checkout.
+  it("resolves an open cross-fork PR for the specified head owner", async () => {
     const forkHeadSha = "c4ce035f493f2c50f656e3e5bdba29b321a74042";
     const forkPr = {
       number: 6,
@@ -2129,7 +2487,7 @@ describe("createGiteaService", () => {
       head: {
         ref: "feat/fork-change",
         sha: forkHeadSha,
-        repo: { id: 2, owner: { login: "contributor" } },
+        repo: { id: 2, full_name: "contributor/renamed", owner: { login: "contributor" } },
       },
       base: {
         ref: "main",
@@ -2157,6 +2515,8 @@ describe("createGiteaService", () => {
       cwd: "/repo",
       headRef: "feat/fork-change",
       headSha: forkHeadSha,
+      headRepositoryOwner: "contributor",
+      headRepositoryPath: "contributor/renamed",
     });
 
     expect(status?.number).toBe(6);

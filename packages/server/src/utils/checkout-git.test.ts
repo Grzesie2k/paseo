@@ -47,10 +47,11 @@ import {
   isDescendantPath,
   warmCheckoutShortstatInBackground,
 } from "./checkout-git.js";
-import { startGitCommandMetrics, stopGitCommandMetrics } from "./run-git-command.js";
+import { runGitCommand, startGitCommandMetrics, stopGitCommandMetrics } from "./run-git-command.js";
 import { createForgeResolver } from "../services/forge-resolver.js";
 import { GitHubCommandError, GitHubCliMissingError } from "../services/github-service.js";
 import type { CurrentPullRequestStatus, ForgeService } from "../services/forge-service.js";
+import { ForgeDiscoveryIncompleteError } from "../services/forge-service.js";
 import {
   TeaAuthenticationError,
   TeaCliMissingError,
@@ -178,6 +179,10 @@ interface RequestedPullRequestTarget {
   headRef: string;
   headSha?: string;
   headRepositoryOwner?: string;
+  headRepositoryPath?: string;
+  headRepositoryHost?: string;
+  headRepositoryEndpoint?: import("../services/forge-service.js").HeadRepositoryEndpoint;
+  changeRequestNumber?: number;
 }
 
 interface RecordingPullRequestTargetsOptions {
@@ -194,6 +199,12 @@ function createGitHubServiceRecordingPullRequestTargets(
       headRef: request.headRef,
       ...(request.headSha ? { headSha: request.headSha } : {}),
       ...(request.headRepositoryOwner ? { headRepositoryOwner: request.headRepositoryOwner } : {}),
+      ...(request.headRepositoryPath ? { headRepositoryPath: request.headRepositoryPath } : {}),
+      ...(request.headRepositoryHost ? { headRepositoryHost: request.headRepositoryHost } : {}),
+      ...(request.headRepositoryEndpoint
+        ? { headRepositoryEndpoint: request.headRepositoryEndpoint }
+        : {}),
+      ...(request.changeRequestNumber ? { changeRequestNumber: request.changeRequestNumber } : {}),
     });
     return createPullRequestStatus({
       ...options.statusOverrides,
@@ -1085,6 +1096,9 @@ const x = 1;
     }
     expect(status.aheadOfOrigin).toBeNull();
     expect(status.behindOfOrigin).toBeNull();
+    const facts = await getCheckoutSnapshotFacts(repoDir);
+    expect(facts.isGit && facts.upstreamKnown).toBe(true);
+    expect(facts.isGit && facts.upstreamStatus).toBeNull();
   });
 
   it("does not report full history as unpushed for fresh no-track Paseo worktrees", async () => {
@@ -3205,6 +3219,124 @@ const x = 1;
     });
   });
 
+  it("carries the full nested head repository path from the tracking remote", async () => {
+    execFileSync(
+      "git",
+      ["remote", "add", "origin", "https://gitlab.example.com/base/project.git"],
+      { cwd: repoDir },
+    );
+    execFileSync(
+      "git",
+      ["remote", "add", "fork", "https://gitlab.example.com/team/subgroup/renamed.git"],
+      { cwd: repoDir },
+    );
+    execFileSync("git", ["checkout", "-b", "topic"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.remote", "fork"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.merge", "refs/heads/topic"], { cwd: repoDir });
+    expect(await readPullRequestLookupTargetFromFacts(repoDir, paseoHome)).toMatchObject({
+      headRef: "topic",
+      headRepositoryPath: "team/subgroup/renamed",
+    });
+  });
+
+  it("does not associate a tracked branch from a different forge host", async () => {
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/project.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["remote", "add", "other", "https://gitea.example.com/acme/project.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["checkout", "-b", "topic"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.remote", "other"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.merge", "refs/heads/topic"], { cwd: repoDir });
+    const targets: RequestedPullRequestTarget[] = [];
+    const forge = createGitHubServiceRecordingPullRequestTargets({ requestedTargets: targets });
+    const facts = await getCheckoutSnapshotFacts(repoDir, { paseoHome });
+    expect(
+      (await getPullRequestStatus(repoDir, forge, undefined, { facts, paseoHome })).status,
+    ).toBeNull();
+    expect(targets).toEqual([]);
+  });
+
+  it.each(["https://forge.example:4000/acme/project.git"])(
+    "does not infer a forge instance for an unverified endpoint %s",
+    async (headRemote) => {
+      execFileSync(
+        "git",
+        ["remote", "add", "origin", "https://forge.example:3000/acme/project.git"],
+        { cwd: repoDir },
+      );
+      execFileSync("git", ["remote", "add", "other", headRemote], { cwd: repoDir });
+      execFileSync("git", ["checkout", "-b", "topic"], { cwd: repoDir });
+      execFileSync("git", ["config", "branch.topic.remote", "other"], { cwd: repoDir });
+      execFileSync("git", ["config", "branch.topic.merge", "refs/heads/topic"], { cwd: repoDir });
+      const facts = await getCheckoutSnapshotFacts(repoDir, {
+        paseoHome,
+        resolveSshHostname: async (host) => host,
+      });
+      const targets: RequestedPullRequestTarget[] = [];
+      const forge = createGitHubServiceRecordingPullRequestTargets({ requestedTargets: targets });
+      expect(
+        (await getPullRequestStatus(repoDir, forge, undefined, { facts, paseoHome })).status,
+      ).toBeNull();
+      expect(targets).toEqual([]);
+    },
+  );
+
+  it("passes a normalized mixed-transport endpoint to the forge for proof", async () => {
+    execFileSync(
+      "git",
+      ["remote", "add", "origin", "https://forge.example:3000/acme/project.git"],
+      { cwd: repoDir },
+    );
+    execFileSync("git", ["remote", "add", "other", "ssh://git@work-alias:2222/acme/project.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["checkout", "-b", "topic"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.remote", "other"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.merge", "refs/heads/topic"], { cwd: repoDir });
+    const facts = await getCheckoutSnapshotFacts(repoDir, {
+      paseoHome,
+      resolveSshHostname: async () => "forge.example",
+    });
+    const targets: RequestedPullRequestTarget[] = [];
+    const forge = createGitHubServiceRecordingPullRequestTargets({ requestedTargets: targets });
+    await getPullRequestStatus(repoDir, forge, undefined, { facts, paseoHome });
+    expect(targets).toEqual([
+      expect.objectContaining({
+        headRepositoryEndpoint: {
+          transport: "ssh",
+          host: "forge.example",
+          port: "2222",
+          path: "acme/project",
+        },
+      }),
+    ]);
+  });
+
+  it("recognizes an SSH alias for the same forge host", async () => {
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/project.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["remote", "add", "fork", "git@work-alias:acme/project.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["checkout", "-b", "topic"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.remote", "fork"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.topic.merge", "refs/heads/topic"], { cwd: repoDir });
+    const context = {
+      paseoHome,
+      resolveSshHostname: async (host: string) => (host === "work-alias" ? "github.com" : host),
+    };
+    const facts = await getCheckoutSnapshotFacts(repoDir, context);
+    const targets: RequestedPullRequestTarget[] = [];
+    const forge = createGitHubServiceRecordingPullRequestTargets({ requestedTargets: targets });
+    expect(
+      (await getPullRequestStatus(repoDir, forge, undefined, { ...context, facts })).status,
+    ).not.toBeNull();
+    expect(targets).toHaveLength(1);
+  });
+
   it.each([
     "git@github.com:contributor/paseo.git",
     "https://github.com/contributor/paseo.git",
@@ -3231,6 +3363,8 @@ const x = 1;
     expect(await readPullRequestLookupTargetFromFacts(repoDir, paseoHome)).toEqual({
       headRef: "topic",
       headRepositoryOwner: "contributor",
+      headRepositoryPath: "contributor/paseo",
+      headRepositoryHost: "github.com:",
       headSha,
     });
   });
@@ -3472,6 +3606,22 @@ const x = 1;
     expect(callCount).toBe(1);
   });
 
+  it("distinguishes a failed upstream read from a successful missing upstream", async () => {
+    const known = await getCheckoutSnapshotFacts(repoDir, { paseoHome });
+    expect(known.isGit && known.upstreamKnown).toBe(true);
+    expect(known.isGit && known.upstreamStatus).toBeNull();
+    const failed = await getCheckoutSnapshotFacts(repoDir, {
+      paseoHome,
+      runGitCommand: async (args, options) => {
+        if (args[0] === "for-each-ref" && args.some((arg) => arg.includes("%(upstream:track")))
+          throw new Error("upstream unavailable");
+        return runGitCommand(args, options);
+      },
+    });
+    expect(failed.isGit && failed.upstreamKnown).toBe(false);
+    expect(failed.isGit && failed.upstreamStatus).toBeNull();
+  });
+
   it("does not reuse a PR status cache entry after HEAD changes on the same branch", async () => {
     execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
     execFileSync("git", ["remote", "add", "origin", "https://github.com/getpaseo/paseo.git"], {
@@ -3497,6 +3647,29 @@ const x = 1;
     expect(second.status?.url).toContain("/pull/2");
     expect(requestedShas).toHaveLength(2);
     expect(requestedShas[0]).not.toBe(requestedShas[1]);
+  });
+
+  it("does not reuse a PR status after changing branch or head repository at the same commit", async () => {
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/first.git"], {
+      cwd: repoDir,
+    });
+    const targets: RequestedPullRequestTarget[] = [];
+    const forge = createGitHubServiceRecordingPullRequestTargets({ requestedTargets: targets });
+    await getPullRequestStatus(repoDir, forge);
+    execFileSync("git", ["checkout", "-b", "other"], { cwd: repoDir });
+    await getPullRequestStatus(repoDir, forge);
+    execFileSync("git", ["remote", "set-url", "origin", "https://github.com/acme/second.git"], {
+      cwd: repoDir,
+    });
+    await getPullRequestStatus(repoDir, forge);
+    expect(targets.map(({ headRef, headRepositoryPath }) => [headRef, headRepositoryPath])).toEqual(
+      [
+        ["feature", "acme/first"],
+        ["other", "acme/first"],
+        ["other", "acme/second"],
+      ],
+    );
   });
 
   it("passes forced PR status reads through to the GitHub service", async () => {
@@ -3625,6 +3798,78 @@ const x = 1;
     } finally {
       __resetPullRequestStatusCacheForTests();
     }
+  });
+
+  it("preserves known status on incomplete discovery but refuses a forced archive read", async () => {
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+    execFileSync("git", ["remote", "add", "origin", "https://gitea.example.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    __setPullRequestStatusCacheTtlForTests(50);
+    try {
+      let calls = 0;
+      const service = createGitHubServiceForStatus(null);
+      service.getCurrentPullRequestStatus = async () => {
+        if (calls++ === 0) return createPullRequestStatus();
+        throw new ForgeDiscoveryIncompleteError("candidate window full");
+      };
+      const fresh = await getPullRequestStatus(repoDir, service);
+      await sleep(80);
+      expect(await getPullRequestStatus(repoDir, service)).toEqual(fresh);
+      await expect(
+        getPullRequestStatus(repoDir, service, { force: true, reason: "archive" }),
+      ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
+    } finally {
+      __resetPullRequestStatusCacheForTests();
+    }
+  });
+
+  it("passes the last observed request to later status reads for revalidation", async () => {
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+    execFileSync("git", ["remote", "add", "origin", "https://gitea.example.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    __setPullRequestStatusCacheTtlForTests(50);
+    try {
+      const seen: Array<{ number?: number; url: string; state: string } | null | undefined> = [];
+      const service = createGitHubServiceForStatus(null);
+      service.getCurrentPullRequestStatus = async (request) => {
+        seen.push(request.previousPullRequest);
+        return createPullRequestStatus({
+          number: 2,
+          url: "https://gitea.example.com/acme/repo/pulls/2",
+        });
+      };
+      await getPullRequestStatus(repoDir, service);
+      await sleep(80);
+      await getPullRequestStatus(repoDir, service);
+      await getPullRequestStatus(repoDir, service, { force: true, reason: "archive" });
+      expect(seen[0]).toBeUndefined();
+      expect(seen.slice(1)).toEqual([
+        expect.objectContaining({ number: 2, state: "open" }),
+        expect.objectContaining({ number: 2, state: "open" }),
+      ]);
+    } finally {
+      __resetPullRequestStatusCacheForTests();
+    }
+  });
+
+  it("uses the workspace association instead of a standalone cached result", async () => {
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+    execFileSync("git", ["remote", "add", "origin", "https://gitea.example.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    const service = createGitHubServiceForStatus(null);
+    const open = { number: 2, url: "https://gitea.example.com/acme/repo/pulls/2", state: "open" };
+    service.getCurrentPullRequestStatus = async (input) =>
+      createPullRequestStatus(
+        input.previousPullRequest?.number === 2 ? open : { number: 1, state: "merged" },
+      );
+    expect((await getPullRequestStatus(repoDir, service)).status?.number).toBe(1);
+    expect(
+      (await getPullRequestStatus(repoDir, service, { previousPullRequest: open })).status?.number,
+    ).toBe(2);
+    expect((await getPullRequestStatus(repoDir, service)).status?.number).toBe(1);
   });
 
   it("does not use stale PR status fallback for forced GitHub errors", async () => {

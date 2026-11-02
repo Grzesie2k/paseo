@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { setImmediate } from "node:timers/promises";
 import { TTLCache } from "@isaacs/ttlcache";
 import type { CheckoutCommit, CheckoutCommitFile } from "@getpaseo/protocol/messages";
-import { parseGitHubRemoteIdentity, parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
+import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import { maxSecuredPlaintextByteLength } from "@getpaseo/relay";
 import type { Logger } from "pino";
 import type { ParsedDiffFile } from "../server/utils/diff-highlighter.js";
@@ -23,8 +23,8 @@ import {
   parseAndHighlightDiff,
   parseDiff,
 } from "../server/utils/diff-highlighter.js";
-import { parseGitHubRepoFromRemote } from "../server/workspace-git-metadata.js";
 import { createGitHubService } from "../services/github-service.js";
+import { ForgeDiscoveryIncompleteError } from "../services/forge-service.js";
 import type {
   CurrentPullRequestStatus,
   ForgeAuthState,
@@ -39,6 +39,7 @@ import {
   ForgeCommandError,
 } from "../services/forge-cli-command.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
+import { resolveSshHostname } from "./ssh-hostname.js";
 import { runGitCommand, type RunGitCommand } from "./run-git-command.js";
 import { readGitFileContents } from "./git-file-contents.js";
 import { unquoteGitPath } from "./git-quoted-path.js";
@@ -97,12 +98,19 @@ const shortstatInFlight = new Map<string, Promise<CheckoutShortstat | null>>();
 interface CheckoutReadCacheOptions {
   force?: boolean;
   reason?: string;
+  previousPullRequest?: { number?: number; url: string; state: string } | null;
 }
 
 interface PullRequestStatusLookupTarget {
   headRef: string;
   headSha?: string;
   headRepositoryOwner?: string;
+  headRepositoryPath?: string;
+  headRepositoryHost?: string;
+  headRepositoryEndpoint?: import("../services/forge-service.js").HeadRepositoryEndpoint;
+  headRepositoryRemoteUrl?: string;
+  forgeHost?: string;
+  changeRequestNumber?: number;
 }
 
 interface PullRequestLookupTargetBranchConfig {
@@ -151,8 +159,22 @@ function createShortstatCache(ttlMs: number) {
   });
 }
 
-function getPullRequestStatusCacheKey(cwd: string, headSha: string | null): string {
-  return `${resolve(cwd)}\u0000${headSha ?? ""}`;
+function getPullRequestStatusCacheKey(
+  cwd: string,
+  remoteUrl: string | null,
+  target: PullRequestStatusLookupTarget,
+): string {
+  return JSON.stringify([
+    resolve(cwd),
+    remoteUrl,
+    target.headRef,
+    target.headSha ?? null,
+    target.headRepositoryPath ?? null,
+    target.headRepositoryHost ?? null,
+    target.headRepositoryEndpoint ?? null,
+    target.headRepositoryOwner ?? null,
+    target.changeRequestNumber ?? null,
+  ]);
 }
 
 function rememberPullRequestStatus(cacheKey: string, status: PullRequestStatusResult): void {
@@ -944,6 +966,7 @@ export interface CheckoutContext {
   logger?: Pick<Logger, "trace" | "warn">;
   facts?: CheckoutSnapshotFacts | null;
   runGitCommand?: RunGitCommand;
+  resolveSshHostname?: typeof resolveSshHostname;
 }
 
 export type CheckoutSnapshotFacts =
@@ -965,6 +988,7 @@ export type CheckoutSnapshotFacts =
       branchRemoteName: string | null;
       branchMergeRef: string | null;
       upstreamStatus: UpstreamStatus | null;
+      upstreamKnown?: boolean;
       pullRequestLookupTarget: PullRequestStatusLookupTarget | null;
     };
 
@@ -1484,25 +1508,6 @@ async function resolvePullRequestStatusLookupTarget(
     branchMergeRef = await getGitConfigValue(cwd, `branch.${currentBranch}.merge`, context);
   }
 
-  const localBranchTarget = buildPullRequestLookupTargetFromBranchConfig({
-    currentBranch,
-    branchRemoteName,
-    branchMergeRef,
-    branchRemoteUrl: null,
-    originRemoteUrl: null,
-    resolvedBaseRef: null,
-  });
-  if (localBranchTarget.headRef === currentBranch) {
-    const pushTarget = await resolvePullRequestLookupTargetFromPushConfig(
-      cwd,
-      currentBranch,
-      null,
-      null,
-      context,
-    );
-    return pushTarget ?? localBranchTarget;
-  }
-
   const [branchRemoteUrl, originRemoteUrl, resolvedBaseRef] = await Promise.all([
     branchRemoteName ? resolveGitRemoteUrl({ cwd, remote: branchRemoteName, context }) : null,
     getGitConfigValue(cwd, "remote.origin.url", context),
@@ -1822,7 +1827,7 @@ async function getUpstreamStatus(
   cwd: string,
   currentBranch: string,
   context?: CheckoutContext,
-): Promise<UpstreamStatus | null> {
+): Promise<{ status: UpstreamStatus | null; known: boolean }> {
   try {
     const { stdout } = await getRunGitCommand(context)(
       [
@@ -1834,13 +1839,13 @@ async function getUpstreamStatus(
     );
     const [ref = "", track = ""] = stdout.trim().split("\0", 2);
     if (!ref || track === "gone") {
-      return null;
+      return { status: null, known: true };
     }
     const ahead = Number.parseInt(track.match(/ahead (\d+)/)?.[1] ?? "0", 10);
     const behind = Number.parseInt(track.match(/behind (\d+)/)?.[1] ?? "0", 10);
-    return { ref, aheadBehind: { ahead, behind } };
+    return { status: { ref, aheadBehind: { ahead, behind } }, known: true };
   } catch {
-    return null;
+    return { status: null, known: false };
   }
 }
 
@@ -1889,12 +1894,14 @@ function buildPullRequestLookupTargetFromBranchConfig(
 ): PullRequestStatusLookupTarget {
   const trackedHeadRef = parseBranchMergeHeadRef(input.branchMergeRef);
   if (!input.branchRemoteName || !trackedHeadRef) {
-    return { headRef: input.currentBranch };
+    const origin = parseRepositoryIdentityFromRemote(input.originRemoteUrl);
+    return { headRef: input.currentBranch, ...(origin ? { headRepositoryPath: origin } : {}) };
   }
 
   const remoteRepo = parseRepositoryIdentityFromRemote(input.branchRemoteUrl);
+  const remoteHost = getRepositoryHost(input.branchRemoteUrl);
   const originRepo = parseRepositoryIdentityFromRemote(input.originRemoteUrl);
-  const isSameRepo = areSameGitHubRepository(remoteRepo, originRepo);
+  const isSameRepo = areSameRepositoryPath(remoteRepo, originRepo);
   const headRepositoryOwner = remoteRepo && !isSameRepo ? remoteRepo.split("/")[0] : null;
   const normalizedBaseRef = input.resolvedBaseRef ? branchNameFromRef(input.resolvedBaseRef) : null;
   if (
@@ -1909,12 +1916,83 @@ function buildPullRequestLookupTargetFromBranchConfig(
   }
 
   if (isSameRepo) {
-    return { headRef: trackedHeadRef };
+    return {
+      headRef: trackedHeadRef,
+      ...(remoteRepo ? { headRepositoryPath: remoteRepo } : {}),
+      ...(remoteHost ? { headRepositoryHost: remoteHost } : {}),
+      ...(input.branchRemoteUrl ? { headRepositoryRemoteUrl: input.branchRemoteUrl } : {}),
+    };
   }
 
   return {
     headRef: trackedHeadRef,
     ...(headRepositoryOwner ? { headRepositoryOwner } : {}),
+    ...(remoteRepo ? { headRepositoryPath: remoteRepo } : {}),
+    ...(remoteHost ? { headRepositoryHost: remoteHost } : {}),
+    ...(input.branchRemoteUrl ? { headRepositoryRemoteUrl: input.branchRemoteUrl } : {}),
+  };
+}
+
+function getRepositoryHost(remoteUrl: string | null): string | null {
+  const location = remoteUrl ? parseGitRemoteLocation(remoteUrl) : null;
+  return location ? `${location.host}:${location.port ?? ""}` : null;
+}
+
+export function isPullRequestTargetOnForge(
+  remoteUrl: string | null,
+  target: PullRequestStatusLookupTarget,
+): boolean {
+  return (
+    !target.headRepositoryHost ||
+    target.headRepositoryHost === (target.forgeHost ?? getRepositoryHost(remoteUrl)) ||
+    Boolean(target.headRepositoryEndpoint)
+  );
+}
+
+async function resolveRepositoryHost(
+  remoteUrl: string | null,
+  resolveHost: typeof resolveSshHostname,
+): Promise<string | null> {
+  const location = remoteUrl ? parseGitRemoteLocation(remoteUrl) : null;
+  if (!location) return null;
+  const host =
+    location.transport === "ssh" || location.transport === "scp"
+      ? ((await resolveHost(location.host)) ?? location.host)
+      : location.host;
+  return `${host}:${location.port ?? ""}`;
+}
+
+async function normalizePullRequestTargetHost(
+  target: PullRequestStatusLookupTarget,
+  remoteUrl: string | null,
+  context?: CheckoutContext,
+): Promise<PullRequestStatusLookupTarget> {
+  if (!target.headRepositoryRemoteUrl) return target;
+  const resolveHost = context?.resolveSshHostname ?? resolveSshHostname;
+  const [headRepositoryHost, forgeHost] = await Promise.all([
+    resolveRepositoryHost(target.headRepositoryRemoteUrl, resolveHost),
+    resolveRepositoryHost(remoteUrl, resolveHost),
+  ]);
+  const { headRepositoryRemoteUrl: _headRepositoryRemoteUrl, ...normalized } = target;
+  const head = parseGitRemoteLocation(target.headRepositoryRemoteUrl);
+  const origin = remoteUrl ? parseGitRemoteLocation(remoteUrl) : null;
+  const headHost = headRepositoryHost?.split(":")[0];
+  const originHost = forgeHost?.split(":")[0];
+  const isSsh = (transport: string) => transport === "ssh" || transport === "scp";
+  const endpoint =
+    head &&
+    origin &&
+    headHost &&
+    headHost === originHost &&
+    headRepositoryHost !== forgeHost &&
+    isSsh(head.transport) !== isSsh(origin.transport)
+      ? { ...head, host: headHost }
+      : undefined;
+  return {
+    ...normalized,
+    ...(endpoint ? { headRepositoryEndpoint: endpoint } : {}),
+    ...(headRepositoryHost ? { headRepositoryHost } : {}),
+    ...(forgeHost && forgeHost !== getRepositoryHost(remoteUrl) ? { forgeHost } : {}),
   };
 }
 
@@ -1923,10 +2001,10 @@ function parseRepositoryIdentityFromRemote(remoteUrl: string | null): string | n
     return null;
   }
   const location = parseGitRemoteLocation(remoteUrl);
-  return location ? (parseGitHubRemoteIdentity(location.path)?.repo ?? null) : null;
+  return location?.path ?? null;
 }
 
-function areSameGitHubRepository(left: string | null, right: string | null): boolean {
+function areSameRepositoryPath(left: string | null, right: string | null): boolean {
   return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
 }
 
@@ -1949,16 +2027,17 @@ function doesLocalBranchNameIdentifyTrackedHead(
 function buildPullRequestLookupTargetFromPushConfig(
   input: PullRequestLookupTargetPushConfig,
 ): PullRequestStatusLookupTarget | null {
-  const pushedHeadRef = parseHeadPushRefspec(input.pushRefspec);
-  if (!input.pushRemoteName || !pushedHeadRef || pushedHeadRef === input.currentBranch) {
+  const configuredHeadRef = parseHeadPushRefspec(input.pushRefspec);
+  if (input.pushRefspec && !configuredHeadRef) return null;
+  const pushedHeadRef = configuredHeadRef ?? input.currentBranch;
+  if (!input.pushRemoteName) {
     return null;
   }
 
-  const remoteRepo = input.pushRemoteUrl ? parseGitHubRepoFromRemote(input.pushRemoteUrl) : null;
-  const originRepo = input.originRemoteUrl
-    ? parseGitHubRepoFromRemote(input.originRemoteUrl)
-    : null;
-  const isSameRepo = areSameGitHubRepository(remoteRepo, originRepo);
+  const remoteRepo = parseRepositoryIdentityFromRemote(input.pushRemoteUrl);
+  const remoteHost = getRepositoryHost(input.pushRemoteUrl);
+  const originRepo = parseRepositoryIdentityFromRemote(input.originRemoteUrl);
+  const isSameRepo = areSameRepositoryPath(remoteRepo, originRepo);
   const headRepositoryOwner = remoteRepo && !isSameRepo ? remoteRepo.split("/")[0] : null;
   const normalizedBaseRef = input.resolvedBaseRef ? branchNameFromRef(input.resolvedBaseRef) : null;
   if (pushedHeadRef === normalizedBaseRef && !headRepositoryOwner) {
@@ -1968,6 +2047,9 @@ function buildPullRequestLookupTargetFromPushConfig(
   return {
     headRef: pushedHeadRef,
     ...(headRepositoryOwner ? { headRepositoryOwner } : {}),
+    ...(remoteRepo ? { headRepositoryPath: remoteRepo } : {}),
+    ...(remoteHost ? { headRepositoryHost: remoteHost } : {}),
+    ...(input.pushRemoteUrl ? { headRepositoryRemoteUrl: input.pushRemoteUrl } : {}),
   };
 }
 
@@ -1982,6 +2064,7 @@ function buildPullRequestLookupTargetFromMetadata(
   return {
     headRef: target.headRef,
     ...(target.headRepositoryOwner ? { headRepositoryOwner: target.headRepositoryOwner } : {}),
+    ...(target.changeRequestNumber ? { changeRequestNumber: target.changeRequestNumber } : {}),
   };
 }
 
@@ -2053,7 +2136,7 @@ async function resolvePullRequestLookupTargetFromPushConfig(
   });
 }
 
-async function resolveFactsPullRequestLookupTarget(input: {
+interface PullRequestFactsLookupInput {
   cwd: string;
   inspected: CheckoutInspectionContext;
   metadata: PaseoWorktreeMetadata | null;
@@ -2062,13 +2145,56 @@ async function resolveFactsPullRequestLookupTarget(input: {
   branchRemoteUrl: string | null;
   resolvedBaseRef: string | null;
   context?: CheckoutContext;
-}): Promise<PullRequestStatusLookupTarget | null> {
+}
+
+async function resolveMetadataPullRequestTarget(
+  input: PullRequestFactsLookupInput,
+  metadataTarget: PullRequestStatusLookupTarget,
+  currentBranch: string,
+): Promise<PullRequestStatusLookupTarget> {
+  const { cwd, inspected, context } = input;
+  const pushTarget = await resolvePullRequestLookupTargetFromPushConfig(
+    cwd,
+    currentBranch,
+    inspected.remoteUrl,
+    input.resolvedBaseRef,
+    context,
+  );
+  if (pushTarget?.headRef === metadataTarget.headRef && pushTarget.headRepositoryPath) {
+    return { ...pushTarget, changeRequestNumber: metadataTarget.changeRequestNumber };
+  }
+  const trackedHeadMatches =
+    parseBranchMergeHeadRef(input.branchMergeRef) === metadataTarget.headRef;
+  let remoteUrl = trackedHeadMatches
+    ? (input.branchRemoteUrl ?? inspected.remoteUrl)
+    : inspected.remoteUrl;
+  if (metadataTarget.headRepositoryOwner) {
+    remoteUrl =
+      !metadataTarget.changeRequestNumber && trackedHeadMatches ? input.branchRemoteUrl : null;
+  }
+  const remotePath = parseRepositoryIdentityFromRemote(remoteUrl);
+  const remoteHost = getRepositoryHost(remoteUrl);
+  return remotePath &&
+    (!metadataTarget.headRepositoryOwner ||
+      remotePath.split("/")[0] === metadataTarget.headRepositoryOwner)
+    ? {
+        ...metadataTarget,
+        headRepositoryPath: remotePath,
+        ...(remoteHost ? { headRepositoryHost: remoteHost } : {}),
+        ...(remoteUrl ? { headRepositoryRemoteUrl: remoteUrl } : {}),
+      }
+    : metadataTarget;
+}
+
+async function resolveFactsPullRequestLookupTarget(
+  input: PullRequestFactsLookupInput,
+): Promise<PullRequestStatusLookupTarget | null> {
   const { cwd, inspected, metadata, context } = input;
   const metadataTarget = inspected.currentBranch
     ? buildPullRequestLookupTargetFromMetadata(metadata, inspected.currentBranch)
     : null;
-  if (metadataTarget) {
-    return metadataTarget;
+  if (metadataTarget && inspected.currentBranch) {
+    return resolveMetadataPullRequestTarget(input, metadataTarget, inspected.currentBranch);
   }
 
   let target = buildInitialPullRequestLookupTarget({
@@ -2092,6 +2218,10 @@ async function resolveFactsPullRequestLookupTarget(input: {
         input.resolvedBaseRef,
         context,
       )) ?? target;
+  }
+  if (target && !target.headRepositoryPath && !target.headRepositoryOwner) {
+    const origin = parseRepositoryIdentityFromRemote(inspected.remoteUrl);
+    if (origin) target = { ...target, headRepositoryPath: origin };
   }
   return target;
 }
@@ -2135,7 +2265,7 @@ export async function getCheckoutSnapshotFacts(
   let branchRemoteUrl: string | null = null;
   const upstreamStatusPromise = inspected.currentBranch
     ? getUpstreamStatus(cwd, inspected.currentBranch, context)
-    : Promise.resolve(null);
+    : Promise.resolve({ status: null, known: false });
   if (inspected.currentBranch) {
     branchRemoteName = await getGitConfigValue(
       cwd,
@@ -2166,7 +2296,14 @@ export async function getCheckoutSnapshotFacts(
     pullRequestLookupTarget,
     context,
   );
-  const upstreamStatus = await upstreamStatusPromise;
+  if (pullRequestLookupTarget) {
+    pullRequestLookupTarget = await normalizePullRequestTargetHost(
+      pullRequestLookupTarget,
+      inspected.remoteUrl,
+      context,
+    );
+  }
+  const upstream = await upstreamStatusPromise;
 
   return {
     isGit: true,
@@ -2182,7 +2319,8 @@ export async function getCheckoutSnapshotFacts(
     comparisonBaseRef,
     branchRemoteName,
     branchMergeRef,
-    upstreamStatus,
+    upstreamStatus: upstream.status,
+    upstreamKnown: upstream.known,
     pullRequestLookupTarget,
   };
 }
@@ -4307,14 +4445,49 @@ export async function createPullRequest(
   return result;
 }
 
+async function resolvePullRequestStatusRead(
+  cwd: string,
+  context?: CheckoutContext,
+): Promise<{ target: PullRequestStatusLookupTarget; remoteUrl: string | null } | null> {
+  if (!context?.facts?.isGit) await requireGitRepo(cwd, context);
+  const head = context?.facts?.isGit
+    ? context.facts.currentBranch
+    : await getCurrentBranch(cwd, context);
+  if (!head) return null;
+  const headSha = await getCurrentHeadSha(cwd, context);
+  const resolvedTarget = await resolvePullRequestStatusLookupTarget(cwd, head, context);
+  let target = headSha && !resolvedTarget.headSha ? { ...resolvedTarget, headSha } : resolvedTarget;
+  const remoteUrl = context?.facts?.isGit
+    ? context.facts.remoteUrl
+    : await getOriginRemoteUrl(cwd, context);
+  if (!context?.facts?.isGit)
+    target = await normalizePullRequestTargetHost(target, remoteUrl, context);
+  return { target, remoteUrl };
+}
+
 export async function getPullRequestStatus(
   cwd: string,
   forgeService: ForgeService = createGitHubService(),
   options?: CheckoutReadCacheOptions,
   context?: CheckoutContext,
 ): Promise<PullRequestStatusResult> {
-  const headSha = await getCurrentHeadSha(cwd, context);
-  const cacheKey = getPullRequestStatusCacheKey(cwd, headSha);
+  const unavailable = getUnavailablePullRequestStatus(context?.facts);
+  if (unavailable) return unavailable;
+  const read = await resolvePullRequestStatusRead(cwd, context);
+  if (!read) return buildPullRequestStatusResult(null, "no_remote");
+  const { target, remoteUrl } = read;
+  if (!isPullRequestTargetOnForge(remoteUrl, target))
+    return buildPullRequestStatusResult(null, "authenticated");
+  if (options && "previousPullRequest" in options) {
+    return getPullRequestStatusUncached(
+      cwd,
+      forgeService,
+      target,
+      options,
+      options.previousPullRequest,
+    );
+  }
+  const cacheKey = getPullRequestStatusCacheKey(cwd, remoteUrl, target);
   if (!options?.force) {
     const cached = pullRequestStatusCache.get(cacheKey);
     if (cached) {
@@ -4327,14 +4500,23 @@ export async function getPullRequestStatus(
     }
   }
 
-  const lookup = getPullRequestStatusUncached(cwd, forgeService, options, context, headSha)
+  const lookup = getPullRequestStatusUncached(
+    cwd,
+    forgeService,
+    target,
+    options,
+    lastSuccessfulPullRequestStatus.get(cacheKey)?.status,
+  )
     .then((status) => {
       pullRequestStatusCache.set(cacheKey, status);
       rememberPullRequestStatus(cacheKey, status);
       return status;
     })
     .catch((error) => {
-      if (!options?.force && error instanceof ForgeCommandError) {
+      if (
+        !options?.force &&
+        (error instanceof ForgeCommandError || error instanceof ForgeDiscoveryIncompleteError)
+      ) {
         const stale = lastSuccessfulPullRequestStatus.get(cacheKey);
         if (stale) {
           return stale;
@@ -4353,27 +4535,11 @@ export async function getPullRequestStatus(
 async function getPullRequestStatusUncached(
   cwd: string,
   forgeService: ForgeService,
+  lookupTarget: PullRequestStatusLookupTarget,
   options?: CheckoutReadCacheOptions,
-  context?: CheckoutContext,
-  headSha?: string | null,
+  previousPullRequest?: { number?: number; url: string; state: string } | null,
 ): Promise<PullRequestStatusResult> {
-  const unavailable = getUnavailablePullRequestStatus(context?.facts);
-  if (unavailable) return unavailable;
-  if (!context?.facts?.isGit) {
-    await requireGitRepo(cwd, context);
-  }
-  const head = context?.facts?.isGit
-    ? context.facts.currentBranch
-    : await getCurrentBranch(cwd, context);
-  if (!head) {
-    return buildPullRequestStatusResult(null, "no_remote");
-  }
   try {
-    const resolvedLookupTarget = await resolvePullRequestStatusLookupTarget(cwd, head, context);
-    const lookupTarget =
-      headSha && !resolvedLookupTarget.headSha
-        ? { ...resolvedLookupTarget, headSha }
-        : resolvedLookupTarget;
     let status: CurrentPullRequestStatus | null;
     if (options?.force) {
       const reason = options.reason;
@@ -4383,6 +4549,7 @@ async function getPullRequestStatusUncached(
       status = await forgeService.getCurrentPullRequestStatus({
         cwd,
         ...lookupTarget,
+        ...(previousPullRequest ? { previousPullRequest } : {}),
         force: true,
         reason,
       });
@@ -4390,6 +4557,7 @@ async function getPullRequestStatusUncached(
       status = await forgeService.getCurrentPullRequestStatus({
         cwd,
         ...lookupTarget,
+        ...(previousPullRequest ? { previousPullRequest } : {}),
         reason: options?.reason,
       });
     }

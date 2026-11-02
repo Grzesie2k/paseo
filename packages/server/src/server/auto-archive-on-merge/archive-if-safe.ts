@@ -47,6 +47,19 @@ const defaultDependencies: ArchiveIfSafeDependencies = {
   killTerminalsForWorkspace,
 };
 
+function isEligibleForMergeArchive(snapshot: WorkspaceGitRuntimeSnapshot): boolean {
+  const pullRequest = snapshot.forge.pullRequest;
+  return Boolean(
+    pullRequest?.isMerged &&
+    !snapshot.forge.error &&
+    snapshot.git.headSha &&
+    snapshot.git.headSha === pullRequest.headSha &&
+    snapshot.git.isDirty === false &&
+    snapshot.git.upstreamKnown === true &&
+    (snapshot.git.aheadOfOrigin === 0 || snapshot.git.aheadOfOrigin === null),
+  );
+}
+
 export async function archiveIfSafe(input: {
   workspaceId: string;
   snapshot: WorkspaceGitRuntimeSnapshot;
@@ -59,13 +72,7 @@ export async function archiveIfSafe(input: {
   const cwd = snapshot.cwd;
   const pullRequest = snapshot.forge.pullRequest;
 
-  if (!pullRequest?.isMerged) {
-    return;
-  }
-  if (snapshot.git.isDirty === true) {
-    return;
-  }
-  if (typeof snapshot.git.aheadOfOrigin === "number" && snapshot.git.aheadOfOrigin > 0) {
+  if (!pullRequest || !isEligibleForMergeArchive(snapshot)) {
     return;
   }
 

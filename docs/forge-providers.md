@@ -97,19 +97,28 @@ Register the adapter in `defaultForgeRegistry` with:
 - `matchesHost` from manifest `cloudHosts`
 - `probeHost` when self-hosted/Enterprise detection is supported
 
-Current change-request lookup uses two identities deliberately:
+Match a change request using the head repository and branch. Within the bounded
+candidate window, prefer an open request, otherwise select the most recently
+updated terminal request, breaking ties by number. A full inconclusive window is
+a failed discovery, so a poll retains its previous status. Gitea does not expose
+a source-branch filter: after its bounded open window it also examines one recent
+all-state page. An older open request outside both windows cannot take precedence
+over a recent terminal request on a cold lookup. When a workspace already shows
+an open request, revalidate it before replacing it with another terminal request.
+A reused branch can display a historical request
+until a new one opens. Display does not depend on checkout HEAD: the checkout can
+be behind the remote PR after its branch is updated during merge.
 
-- An open PR/MR belongs to the checkout when its head branch and head repository
-  match. Its remote head SHA may differ because the checkout can be ahead,
-  behind, or contain commits that have not been pushed yet.
-- A merged or closed PR/MR belongs to the checkout only when its recorded head
-  SHA exactly matches the checkout's current `HEAD`. Branch names are reusable;
-  selecting the newest terminal request by branch alone can silently attach an
-  old promotion or feature request to new work.
+For mixed SSH and HTTPS ports on one host, require the source repository's native
+clone URL to match the normalized checkout endpoint. Different HTTP ports remain
+distinct forge instances. Unknown clone URLs do not establish identity.
 
-Thread the checkout head SHA through adapter cache and poll identities as well
-as the lookup itself. Otherwise a commit made on the same branch can inherit the
-previous commit's cached terminal status until the cache expires.
+Auto-archive has a narrower contract. It requires a fresh, observed open-to-merged
+transition and an exact match between the checkout HEAD and the forge's recorded
+PR head, a successful upstream safety read, and the workspace safety checks. A
+successful read reporting no upstream is distinct from a failed read. Keep
+checkout HEAD in cache and poll identities so a checkout change refreshes those
+safety facts.
 
 Cloud hosts in the manifest are a bounded public-host list, not a self-host
 allowlist. Self-hosted detection is a trust gate: Paseo only talks to a forge

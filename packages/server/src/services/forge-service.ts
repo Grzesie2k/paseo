@@ -1,4 +1,29 @@
 import type { ForgeSearchKind } from "@getpaseo/protocol/messages";
+import { parseGitRemoteLocation, type GitRemoteLocation } from "@getpaseo/protocol/git-remote";
+
+/** A checkout endpoint that must be proven against the candidate's native clone URL. */
+export type HeadRepositoryEndpoint = GitRemoteLocation;
+
+/** The bounded discovery window could not establish a result. */
+export class ForgeDiscoveryIncompleteError extends Error {}
+
+export function matchesHeadRepositoryEndpoint(
+  endpoint: HeadRepositoryEndpoint | undefined,
+  urls: (string | null | undefined)[],
+): boolean {
+  if (!endpoint) return true;
+  return urls.some((url) => {
+    const candidate = url ? parseGitRemoteLocation(url) : null;
+    if (!candidate) return false;
+    const transport = (value: GitRemoteLocation["transport"]) => (value === "scp" ? "ssh" : value);
+    return (
+      transport(candidate.transport) === transport(endpoint.transport) &&
+      candidate.host === endpoint.host &&
+      candidate.port === endpoint.port &&
+      candidate.path.toLowerCase() === endpoint.path.toLowerCase()
+    );
+  });
+}
 
 export type ForgeSearchRequestKind = ForgeSearchKind | "github-issue" | "github-pr" | "pr";
 
@@ -114,6 +139,8 @@ export type ForgeAuthState =
 export type ForgeSpecificStatusFacts = { forge: string } & Record<string, unknown>;
 
 export interface CurrentPullRequestStatus {
+  /** Commit recorded as the change request's head by the forge. */
+  headSha?: string;
   number?: number;
   repoOwner?: string;
   repoName?: string;
@@ -472,6 +499,11 @@ export interface ForgeService {
       headRef: string;
       headSha?: string;
       headRepositoryOwner?: string;
+      headRepositoryPath?: string;
+      headRepositoryHost?: string;
+      headRepositoryEndpoint?: HeadRepositoryEndpoint;
+      previousPullRequest?: { number?: number; url: string; state: string } | null;
+      changeRequestNumber?: number;
     } & ForgeReadOptions,
   ): Promise<CurrentPullRequestStatus | null>;
   getPullRequestTimeline(options: GetPullRequestTimelineOptions): Promise<PullRequestTimeline>;
@@ -513,6 +545,9 @@ export interface ForgeService {
     headRef: string;
     headSha?: string;
     headRepositoryOwner?: string;
+    headRepositoryPath?: string;
+    headRepositoryEndpoint?: HeadRepositoryEndpoint;
+    changeRequestNumber?: number;
     onStatus?: (status: CurrentPullRequestStatus | null) => void;
     onError?: (error: unknown) => void;
   }): { unsubscribe: () => void };

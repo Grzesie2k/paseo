@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PullRequestCommandStatus } from "./forge-service.js";
+import { ForgeDiscoveryIncompleteError } from "./forge-service.js";
 import { GITLAB_ACTIVE_PIPELINE_STATUS_SET } from "@getpaseo/protocol/gitlab-pipeline";
 import type { GitLabStatusFacts } from "./gitlab-facts.js";
 import {
@@ -261,6 +262,84 @@ const DISCUSSIONS = [
 ];
 
 describe("createGitLabService", () => {
+  it("requires native clone URL proof for mixed transport ports and isolates cached endpoints", async () => {
+    const mr = { ...OPEN_MR, source_branch: "topic" };
+    let cloneUrl: string | undefined =
+      "ssh://git@gitlab.example.com:2222/example-group/example-project.git";
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([mr]));
+      if (args[1] === "view") return ok(JSON.stringify(mr));
+      if (args[1] === "projects/example-group%2Fexample-project")
+        return ok(
+          JSON.stringify({
+            id: 101,
+            path_with_namespace: "example-group/example-project",
+            ssh_url_to_repo: cloneUrl,
+          }),
+        );
+      return ok("{}");
+    });
+    const endpoint = {
+      transport: "ssh" as const,
+      host: "gitlab.example.com",
+      port: "2222",
+      path: "example-group/example-project",
+    };
+    const input = {
+      cwd: "/repo",
+      headRef: "topic",
+      headRepositoryPath: endpoint.path,
+      headRepositoryEndpoint: endpoint,
+    };
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(14);
+    expect(
+      await service.getCurrentPullRequestStatus({
+        ...input,
+        headRepositoryEndpoint: { ...endpoint, port: "2223" },
+      }),
+    ).toBeNull();
+    expect(
+      (await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" }))
+        ?.number,
+    ).toBe(14);
+    cloneUrl = undefined;
+    expect(
+      await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" }),
+    ).toBeNull();
+    expect(
+      calls.filter((args) => args[1] === "projects/example-group%2Fexample-project"),
+    ).toHaveLength(3);
+  });
+  it("finds the target fork without reading unrelated source projects", async () => {
+    const unrelated = Array.from({ length: 4 }, (_, i) => ({
+      ...OPEN_MR,
+      iid: i + 30,
+      source_branch: "topic",
+      source_project_id: i + 200,
+    }));
+    const wanted = { ...OPEN_MR, iid: 44, source_branch: "topic", source_project_id: 300 };
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([...unrelated, wanted]));
+      if (args[1] === "view") return ok(JSON.stringify(wanted));
+      if (args[1] === "projects/team%2Ffork")
+        return ok(JSON.stringify({ id: 300, path_with_namespace: "team/fork" }));
+      if (args[0] === "api" && /^projects\/\d+$/.test(args[1]))
+        return ok(
+          JSON.stringify({ id: Number(args[1].split("/")[1]), path_with_namespace: "other/repo" }),
+        );
+      return ok("{}");
+    });
+    expect(
+      (
+        await service.getCurrentPullRequestStatus({
+          cwd: "/repo",
+          headRef: "topic",
+          headRepositoryPath: "team/fork",
+        })
+      )?.number,
+    ).toBe(44);
+    expect(calls.filter((args) => /^projects\/\d+$/.test(args[1] ?? ""))).toHaveLength(0);
+  });
   it("maps a glab merge request view to the neutral current PR status", async () => {
     const { service, calls } = makeService((args) =>
       ok(JSON.stringify(args[1] === "list" ? [OPEN_MR] : OPEN_MR)),
@@ -321,7 +400,7 @@ describe("createGitLabService", () => {
     expect(status).toBeNull();
   });
 
-  it("selects a terminal merge request only when its head SHA matches the checkout", async () => {
+  it("selects the latest terminal merge request even when the checkout head differs", async () => {
     const branch = "dev";
     const checkoutSha = "2222222222222222222222222222222222222222";
     const newestStale = {
@@ -342,7 +421,7 @@ describe("createGitLabService", () => {
     };
     const { service, calls } = makeService((args) => {
       if (args[1] === "list") return ok(JSON.stringify([newestStale, exactOlder]));
-      if (args[1] === "view" && args[2] === "270") return ok(JSON.stringify(exactOlder));
+      if (args[1] === "view" && args[2] === "271") return ok(JSON.stringify(newestStale));
       if (args[0] === "api") return ok("{}");
       throw new Error(`unexpected call: ${args.join(" ")}`);
     });
@@ -353,18 +432,159 @@ describe("createGitLabService", () => {
       headSha: checkoutSha,
     });
 
-    expect(status?.number).toBe(270);
-    expect(calls[1]).toEqual(["mr", "view", "270", "-F", "json"]);
+    expect(status?.number).toBe(271);
+    expect(status?.headSha).toBe(newestStale.sha);
+    expect(calls[1]).toEqual(["mr", "view", "271", "-F", "json"]);
   });
 
-  it("does not attach the latest historical merge request after a reused branch advances", async () => {
+  it.each(["opened", "merged"])(
+    "matches a nested, renamed fork for a %s merge request",
+    async (state) => {
+      const wrong = { ...OPEN_MR, iid: 41, state, source_branch: "topic", source_project_id: 201 };
+      const right = { ...wrong, iid: 42, source_project_id: 202 };
+      const { service } = makeService((args) => {
+        if (args[1] === "list") return ok(JSON.stringify([wrong, right]));
+        if (args[1] === "view") return ok(JSON.stringify(right));
+        if (args[1] === "projects/team%2Fsubgroup%2Frenamed")
+          return ok(JSON.stringify({ id: 202, path_with_namespace: "team/subgroup/renamed" }));
+        if (args[1] === "projects/201")
+          return ok(JSON.stringify({ path_with_namespace: "team/subgroup/other" }));
+        if (args[1] === "projects/202")
+          return ok(JSON.stringify({ path_with_namespace: "team/subgroup/renamed" }));
+        if (args[0] === "api") return ok("{}");
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      });
+      const result = await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "topic",
+        headRepositoryPath: "team/subgroup/renamed",
+      });
+      expect(result?.number).toBe(42);
+    },
+  );
+
+  it("resolves a checkout hint to the full fork project before selecting the current request", async () => {
+    const hint = { ...OPEN_MR, iid: 41, source_branch: "topic", source_project_id: 202 };
+    const current = { ...hint, iid: 42, state: "opened" };
+    const { service } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([current]));
+      if (args[1] === "view") return ok(JSON.stringify(args[2] === "41" ? hint : current));
+      if (args[1] === "projects/202")
+        return ok(JSON.stringify({ path_with_namespace: "team/subgroup/renamed" }));
+      if (args[1] === "projects/team%2Fsubgroup%2Frenamed")
+        return ok(JSON.stringify({ id: 202, path_with_namespace: "team/subgroup/renamed" }));
+      if (args[0] === "api") return ok("{}");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const result = await service.getCurrentPullRequestStatus({
+      cwd: "/repo",
+      headRef: "topic",
+      headRepositoryOwner: "team",
+      changeRequestNumber: 41,
+    });
+    expect(result?.number).toBe(42);
+  });
+
+  it("prefers an open merge request over a more recently updated terminal request", async () => {
+    const terminal = {
+      ...OPEN_MR,
+      iid: 50,
+      state: "merged",
+      source_branch: "topic",
+      updated_at: "2026-08-01T00:00:00Z",
+    };
+    const open = {
+      ...OPEN_MR,
+      iid: 49,
+      state: "opened",
+      source_branch: "topic",
+      updated_at: "2026-07-01T00:00:00Z",
+    };
+    const { service } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([terminal, open]));
+      if (args[1] === "view") return ok(JSON.stringify(open));
+      if (args[0] === "api") return ok("{}");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).toMatchObject({ number: 49, state: "open" });
+  });
+
+  it("does not select a terminal request when the first page cannot establish whether an open one exists", async () => {
+    const terminal = Array.from({ length: 100 }, (_, i) => ({
+      ...OPEN_MR,
+      iid: i + 100,
+      state: "merged",
+      source_branch: "topic",
+    }));
+    const open = { ...OPEN_MR, iid: 99, state: "opened", source_branch: "topic" };
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list")
+        return ok(JSON.stringify(args.includes("--page") ? [open] : terminal));
+      if (args[1] === "view") return ok(JSON.stringify(open));
+      if (args[0] === "api") return ok("{}");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
+    expect(calls.filter((args) => args[1] === "list")).toHaveLength(1);
+  });
+
+  it("bounds source project identity reads when a branch is crowded", async () => {
+    const requests = Array.from({ length: 4 }, (_, i) => ({
+      ...OPEN_MR,
+      iid: i + 20,
+      state: "merged",
+      source_branch: "topic",
+      source_project_id: i + 200,
+    }));
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify(requests));
+      if (args[0] === "api" && args[1].startsWith("projects/"))
+        return ok(JSON.stringify({ path_with_namespace: "elsewhere/repo" }));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }),
+    ).toBeNull();
+    expect(
+      calls.filter((args) => args[0] === "api" && /^projects\/\d+$/.test(args[1])),
+    ).toHaveLength(0);
+  });
+
+  it("reuses a resolved source project identity on subsequent polls", async () => {
+    const mr = { ...OPEN_MR, iid: 44, source_branch: "topic", source_project_id: 202 };
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([mr]));
+      if (args[1] === "view") return ok(JSON.stringify(mr));
+      if (args[1] === "projects/team%2Ffork")
+        return ok(JSON.stringify({ id: 202, path_with_namespace: "team/fork" }));
+      if (args[0] === "api") return ok("{}");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    const input = { cwd: "/repo", headRef: "topic", headRepositoryPath: "team/fork" };
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(44);
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(44);
+    expect(calls.filter((args) => args[1] === "projects/team%2Ffork")).toHaveLength(1);
+    await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" });
+    expect(calls.filter((args) => args[1] === "projects/team%2Ffork")).toHaveLength(2);
+  });
+
+  it("shows the latest historical merge request after a reused branch advances", async () => {
     const stale = {
       ...OPEN_MR,
       state: "merged",
       source_branch: "dev",
       sha: "1111111111111111111111111111111111111111",
     };
-    const { service, calls } = makeService(() => ok(JSON.stringify([stale])));
+    const { service, calls } = makeService((args) => {
+      if (args[1] === "list") return ok(JSON.stringify([stale]));
+      if (args[1] === "view") return ok(JSON.stringify(stale));
+      if (args[0] === "api") return ok("{}");
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
 
     await expect(
       service.getCurrentPullRequestStatus({
@@ -372,8 +592,8 @@ describe("createGitLabService", () => {
         headRef: "dev",
         headSha: "2222222222222222222222222222222222222222",
       }),
-    ).resolves.toBeNull();
-    expect(calls).toEqual([currentMrListArgs("dev")]);
+    ).resolves.toMatchObject({ number: stale.iid, state: "merged" });
+    expect(calls[0]).toEqual(currentMrListArgs("dev"));
   });
 
   it("looks up a numeric current branch through the source-branch list filter", async () => {

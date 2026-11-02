@@ -94,6 +94,9 @@ if (origin === fixtureRemote) {
       labels: [],
       baseRefName: "main",
       headRefName: isFork ? "pr-branch-2" : "pr-branch-1",
+      headRefOid: spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).stdout?.trim() || "",
+      headRepositoryOwner: { login: isFork ? "fork-owner" : "paseo-e2e" },
+      headRepository: { name: "local-fixture" },
       updatedAt: "2026-01-01T00:00:00Z"
     };
     process.stdout.write(JSON.stringify(command === "pr list" ? [pr] : pr));

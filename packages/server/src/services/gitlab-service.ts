@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LRUCache } from "lru-cache";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
 import {
@@ -17,6 +18,8 @@ import {
   createUnavailableSearchResult,
   normalizeForgeSearchKinds,
   parseOptionalTime,
+  matchesHeadRepositoryEndpoint,
+  ForgeDiscoveryIncompleteError,
 } from "./forge-service.js";
 import type {
   CheckDetails,
@@ -720,6 +723,7 @@ function toCurrentPullRequestStatus(
   const projectPath = extractProjectPath(mr.references?.full);
   return {
     number: mr.iid,
+    ...(mr.sha ? { headSha: mr.sha } : {}),
     ...(owner ? { repoOwner: owner } : {}),
     ...(name ? { repoName: name } : {}),
     ...(projectPath ? { projectPath } : {}),
@@ -911,6 +915,15 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
   const runner = options.runner ?? runGlabCommand;
   const resolveGlab = createCachedCliPathResolver(options.resolveGlabPath ?? resolveGlabPath);
   const resolveRemoteUrl = options.resolveRemoteUrl ?? defaultResolveRemoteUrl;
+  const projectPaths = new LRUCache<
+    string,
+    {
+      id?: number;
+      path_with_namespace: string;
+      ssh_url_to_repo?: string | null;
+      http_url_to_repo?: string | null;
+    }
+  >({ max: 512, ttl: 120_000 });
 
   async function run(args: string[], runOptions: GlabCommandRunnerOptions): Promise<string> {
     const glabPath = await resolveGlab();
@@ -974,20 +987,122 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
     );
   }
 
+  async function resolveExpectedHeadProject(
+    cwd: string,
+    headRepositoryPath?: string,
+    headRepositoryOwner?: string,
+    changeRequestNumber?: number,
+    force = false,
+  ): Promise<string | null> {
+    const remote = await resolveRemoteUrl(cwd);
+    const remotePath = remote ? parseGitRemoteLocation(remote)?.path : null;
+    if (!remotePath) return null;
+    if (headRepositoryPath) return headRepositoryPath;
+    if (!headRepositoryOwner) return remotePath;
+    if (!changeRequestNumber) return null;
+    const hint = await viewMergeRequest(cwd, String(changeRequestNumber));
+    if (hint.source_project_id == null) return null;
+    const path = (await readProject(cwd, hint.source_project_id, force)).path_with_namespace;
+    return path.split("/")[0]?.toLowerCase() === headRepositoryOwner.toLowerCase() ? path : null;
+  }
+
+  async function readProject(cwd: string, projectId: number | string, force = false) {
+    const key = JSON.stringify([cwd, await resolveRemoteUrl(cwd), projectId]);
+    const cached = force ? undefined : projectPaths.get(key);
+    if (cached) return cached;
+    const source = await runJson(
+      ["api", `projects/${encodeURIComponent(projectId)}`],
+      { cwd },
+      z.object({
+        id: z.number().optional(),
+        path_with_namespace: z.string(),
+        ssh_url_to_repo: z.string().nullable().optional(),
+        http_url_to_repo: z.string().nullable().optional(),
+      }),
+    );
+    projectPaths.set(key, source);
+    return source;
+  }
+
+  async function resolveExpectedProjectId(input: {
+    cwd: string;
+    expectedPath: string;
+    mergeRequests: GitLabMergeRequest[];
+    force: boolean;
+    endpoint?: import("./forge-service.js").HeadRepositoryEndpoint;
+  }): Promise<number | null> {
+    const remote = await resolveRemoteUrl(input.cwd);
+    const originPath = remote ? parseGitRemoteLocation(remote)?.path : null;
+    const targetId =
+      input.expectedPath.toLowerCase() === originPath?.toLowerCase()
+        ? input.mergeRequests.find(
+            (mr) =>
+              extractProjectPath(mr.references?.full)?.toLowerCase() ===
+              input.expectedPath.toLowerCase(),
+          )?.target_project_id
+        : undefined;
+    if (!input.endpoint && targetId != null) return targetId;
+    const project = await readProject(input.cwd, input.expectedPath, input.force);
+    if (
+      !matchesHeadRepositoryEndpoint(input.endpoint, [
+        project.ssh_url_to_repo,
+        project.http_url_to_repo,
+      ])
+    )
+      return null;
+    return project.id ?? null;
+  }
+
   async function resolveCurrentMergeRequest(
     cwd: string,
     headRef: string,
-    headSha?: string,
+    headRepositoryPath?: string,
+    headRepositoryOwner?: string,
+    changeRequestNumber?: number,
+    force = false,
+    headRepositoryEndpoint?: import("./forge-service.js").HeadRepositoryEndpoint,
   ): Promise<GitLabMergeRequest | null> {
     const mergeRequests = await listMergeRequestsBySourceBranch(cwd, headRef);
-    const candidates = mergeRequests.filter((mr) => mr.source_branch === headRef);
+    if (mergeRequests.length === 0) return null;
+    const expectedPath = await resolveExpectedHeadProject(
+      cwd,
+      headRepositoryPath,
+      headRepositoryOwner,
+      changeRequestNumber,
+      force,
+    );
+    if (!expectedPath) return null;
+    const expectedProjectId = await resolveExpectedProjectId({
+      cwd,
+      expectedPath,
+      mergeRequests,
+      force,
+      endpoint: headRepositoryEndpoint,
+    });
+    if (expectedProjectId == null) return null;
+    const candidates: GitLabMergeRequest[] = [];
+    for (const mr of mergeRequests) {
+      if (
+        mr.source_branch !== headRef ||
+        mr.source_project_id == null ||
+        mr.target_project_id == null
+      )
+        continue;
+      if (mr.source_project_id === expectedProjectId) {
+        if (mapMergeRequestState(mr.state) === "open") return viewMergeRequest(cwd, String(mr.iid));
+        candidates.push(mr);
+      }
+    }
+    candidates.sort(
+      (a, b) =>
+        parseGitLabTimestamp(b.updated_at) - parseGitLabTimestamp(a.updated_at) || b.iid - a.iid,
+    );
     const match =
-      candidates.find((mr) => mapMergeRequestState(mr.state) === "open") ??
-      candidates.find(
-        (mr) =>
-          mapMergeRequestState(mr.state) !== "open" && headSha !== undefined && mr.sha === headSha,
-      ) ??
-      null;
+      candidates.find((mr) => mapMergeRequestState(mr.state) === "open") ?? candidates[0] ?? null;
+    if (mergeRequests.length >= 100 && (!match || mapMergeRequestState(match.state) !== "open"))
+      throw new ForgeDiscoveryIncompleteError(
+        "GitLab merge request discovery exceeded its candidate window",
+      );
     return match ? viewMergeRequest(cwd, String(match.iid)) : null;
   }
 
@@ -1151,7 +1266,15 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
 
     async getCurrentPullRequestStatus(input): Promise<CurrentPullRequestStatus | null> {
       try {
-        const mr = await resolveCurrentMergeRequest(input.cwd, input.headRef, input.headSha);
+        const mr = await resolveCurrentMergeRequest(
+          input.cwd,
+          input.headRef,
+          input.headRepositoryPath,
+          input.headRepositoryOwner,
+          input.changeRequestNumber,
+          input.force === true,
+          input.headRepositoryEndpoint,
+        );
         if (!mr) {
           return null;
         }
@@ -1448,6 +1571,8 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
       return { success: true };
     },
 
-    invalidate(_input: { cwd: string }): void {},
+    invalidate(_input: { cwd: string }): void {
+      projectPaths.clear();
+    },
   };
 }

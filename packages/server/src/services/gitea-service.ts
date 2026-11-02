@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LRUCache } from "lru-cache";
 import { CHECK_TRAIT_ACTION_REQUIRED, CHECK_TRAIT_WARNING } from "@getpaseo/protocol/check-traits";
 import { mapGiteaCommitState } from "@getpaseo/protocol/gitea-status";
 import pLimit from "p-limit";
@@ -27,6 +28,8 @@ import {
   createUnavailableSearchResult,
   normalizeForgeSearchKinds,
   parseOptionalTime,
+  matchesHeadRepositoryEndpoint,
+  ForgeDiscoveryIncompleteError,
 } from "./forge-service.js";
 import type {
   CheckDetails,
@@ -95,6 +98,7 @@ const ISSUE_LIST_FIELDS = "index,state,author,url,title,body,labels,comments,cre
 
 const CURRENT_PR_LOOKUP_PAGE_SIZE = 50;
 const CURRENT_PR_OPEN_LOOKUP_MAX_PAGES = 4;
+const CURRENT_PR_IDENTITY_READ_LIMIT = 3;
 const TIMELINE_PAGE_SIZE = 50;
 const TIMELINE_MAX_PAGES_PER_BUCKET = 4;
 
@@ -160,6 +164,7 @@ const GiteaPrListItemSchema = z
     head: z.string().optional(),
     created: z.string().optional(),
     updated: z.string().optional(),
+    headSha: z.string().optional(),
     labels: z.string().optional(),
     ci: z.string().optional(),
   })
@@ -223,7 +228,9 @@ const GiteaPullRequestViewSchema = z
 const GiteaPullRequestRepoSchema = z
   .object({
     id: z.number().optional(),
+    full_name: z.string().optional(),
     ssh_url: z.string().nullable().optional(),
+    clone_url: z.string().nullable().optional(),
     html_url: z.string().nullable().optional(),
     owner: z.object({ login: z.string().optional() }).passthrough().nullable().optional(),
   })
@@ -1010,6 +1017,7 @@ function currentPullRequestApiToListItem(item: GiteaCurrentPullRequestApi): Gite
     ...(item.mergeable != null ? { mergeable: String(item.mergeable) } : {}),
     base: item.base.ref,
     head,
+    headSha: item.head.sha,
     updated: item.updated_at,
     labels: item.labels.map((label) => label.name).join(","),
   };
@@ -1082,6 +1090,7 @@ function toCurrentPullRequestStatus(item: GiteaPrListItem): CurrentPullRequestSt
     state,
     baseRefName: item.base ?? "",
     headRefName: stripHeadOwner(item.head),
+    ...(item.headSha ? { headSha: item.headSha } : {}),
     isMerged: state === "merged",
     mergeable: mapGiteaMergeable(item),
     checks: [],
@@ -1394,6 +1403,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
   const resolveCurrentBranch = options.resolveCurrentBranch ?? defaultResolveCurrentBranch;
   const now = options.now ?? Date.now;
   const currentPrHeadShaCache = new Map<string, { sha: string; expiresAt: number }>();
+  const pullRequestIdentityCache = new LRUCache<string, boolean>({ max: 512, ttl: 120_000 });
 
   async function run(args: string[], runOptions: TeaCommandRunnerOptions): Promise<string> {
     const teaPath = await resolveTea();
@@ -1578,6 +1588,12 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     cwd: string;
     headRef: string;
     headSha?: string;
+    headRepositoryOwner?: string;
+    headRepositoryPath?: string;
+    headRepositoryEndpoint?: import("./forge-service.js").HeadRepositoryEndpoint;
+    changeRequestNumber?: number;
+    force?: boolean;
+    previousPullRequest?: { number?: number; url: string; state: string } | null;
   }): Promise<CurrentPullRequestStatus | null> {
     const match = await findCurrentPullRequestForHeadRef(input);
     if (!match) {
@@ -1606,21 +1622,154 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     cwd: string;
     headRef: string;
     headSha?: string;
+    headRepositoryOwner?: string;
+    headRepositoryPath?: string;
+    headRepositoryEndpoint?: import("./forge-service.js").HeadRepositoryEndpoint;
+    changeRequestNumber?: number;
+    force?: boolean;
+    previousPullRequest?: { number?: number; url: string; state: string } | null;
   }): Promise<GiteaPrListItem | null> {
     const repoIdentity = await resolveCurrentRepoIdentity(input.cwd);
-    const expectedHeadOwner = repoIdentity?.owner ?? null;
-    const openMatch = await findOpenPullRequestForHeadRef(input, expectedHeadOwner);
-    if (openMatch) {
-      return openMatch;
-    }
-
-    // tea discovers repository context from any configured git remote, while
-    // the default remote resolver reads origin only. Preserve that broader
-    // discovery for repositories whose primary remote has another name.
     const repoPath = repoIdentity
       ? `repos/${encodeURIComponent(repoIdentity.owner)}/${encodeURIComponent(repoIdentity.name)}`
       : "repos/{owner}/{repo}";
-    const recentItems = await runJsonArray(
+    let expectedPath =
+      input.headRepositoryPath ??
+      (input.headRepositoryOwner
+        ? null
+        : repoIdentity && `${repoIdentity.owner}/${repoIdentity.name}`);
+    if (!expectedPath && input.headRepositoryOwner && input.changeRequestNumber) {
+      const hint = await runJson(
+        ["api", `${repoPath}/pulls/${input.changeRequestNumber}`],
+        { cwd: input.cwd },
+        GiteaCurrentPullRequestApiSchema,
+      );
+      const path = hint.head.repo?.full_name;
+      if (path?.split("/")[0]?.toLowerCase() === input.headRepositoryOwner.toLowerCase())
+        expectedPath = path;
+    }
+    if (!expectedPath) return null;
+    const expectedHeadOwner = expectedPath.split("/")[0] ?? null;
+    const matchesRepository = (item: GiteaCurrentPullRequestApi): boolean => {
+      const headPath =
+        item.head.repo?.full_name ??
+        (item.head.repo?.id !== undefined &&
+        item.head.repo.id === item.base.repo?.id &&
+        repoIdentity
+          ? `${repoIdentity.owner}/${repoIdentity.name}`
+          : null);
+      return (
+        headPath?.toLowerCase() === expectedPath.toLowerCase() &&
+        matchesHeadRepositoryEndpoint(input.headRepositoryEndpoint, [
+          item.head.repo?.ssh_url,
+          item.head.repo?.clone_url,
+          item.head.repo?.html_url,
+        ])
+      );
+    };
+    const open = await findOpenPullRequestForHeadRef(
+      input,
+      expectedHeadOwner,
+      repoPath,
+      matchesRepository,
+      expectedPath,
+      input.headRepositoryEndpoint,
+    );
+    if (open.match) return open.match;
+    // A full open window does not make the recent all-state window useless:
+    // Gitea does not expose a source-branch filter for this endpoint.
+    return resolveRecentPullRequest({
+      ...input,
+      expectedHeadOwner,
+      repoPath,
+      matchesRepository,
+      exhausted: open.exhausted,
+    });
+  }
+
+  async function resolveRecentPullRequest(input: {
+    cwd: string;
+    headRef: string;
+    previousPullRequest?: { number?: number; url: string; state: string } | null;
+    expectedHeadOwner: string | null;
+    repoPath: string;
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean;
+    exhausted: boolean;
+  }): Promise<GiteaPrListItem | null> {
+    let recent: GiteaPrListItem | null;
+    try {
+      recent = await findRecentPullRequestForHeadRef(
+        input,
+        input.expectedHeadOwner,
+        input.repoPath,
+        input.matchesRepository,
+      );
+    } catch (error) {
+      if (!(error instanceof ForgeDiscoveryIncompleteError) || !input.exhausted) throw error;
+      const prior = await revalidatePreviousPullRequest({
+        ...input,
+        recent: null,
+      });
+      if (prior) return prior;
+      throw error;
+    }
+    if (input.exhausted) {
+      const prior = await revalidatePreviousPullRequest({
+        ...input,
+        recent,
+      });
+      if (prior) return prior;
+    }
+    if (!recent && input.exhausted)
+      throw new ForgeDiscoveryIncompleteError(
+        "Gitea pull request discovery exceeded its open candidate window",
+      );
+    return recent;
+  }
+
+  async function revalidatePreviousPullRequest(input: {
+    cwd: string;
+    headRef: string;
+    repoPath: string;
+    expectedHeadOwner: string | null;
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean;
+    previousPullRequest?: { number?: number; url: string; state: string } | null;
+    recent: GiteaPrListItem | null;
+  }): Promise<GiteaPrListItem | null> {
+    const previous = input.previousPullRequest;
+    if (previous?.state !== "open") return null;
+    if (
+      input.recent &&
+      (mapGiteaState(input.recent.state) === "open" || input.recent.url === previous.url)
+    )
+      return null;
+    if (!previous.number)
+      throw new ForgeDiscoveryIncompleteError(
+        "Cannot revalidate the previously observed open pull request",
+      );
+    const current = await runJson(
+      ["api", `${input.repoPath}/pulls/${previous.number}`],
+      { cwd: input.cwd },
+      GiteaCurrentPullRequestApiSchema,
+    );
+    const candidate = currentPullRequestApiToListItem(current);
+    return candidate.url === previous.url &&
+      matchesCurrentHeadRef(candidate, input.headRef, input.expectedHeadOwner) &&
+      input.matchesRepository(current)
+      ? candidate
+      : null;
+  }
+
+  async function findRecentPullRequestForHeadRef(
+    input: { cwd: string; headRef: string },
+    expectedHeadOwner: string | null,
+    repoPath: string,
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean,
+  ): Promise<GiteaPrListItem | null> {
+    // tea discovers repository context from any configured git remote, while
+    // the default remote resolver reads origin only. Preserve that broader
+    // discovery for repositories whose primary remote has another name.
+    const items = await runJsonArray(
       [
         "api",
         `${repoPath}/pulls?state=all&sort=recentupdate&page=1&limit=${CURRENT_PR_LOOKUP_PAGE_SIZE}`,
@@ -1628,32 +1777,31 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
       { cwd: input.cwd },
       GiteaCurrentPullRequestApiSchema,
     );
-    const candidates = recentItems.filter((item) => {
-      if (
+    const candidates = items.filter(
+      (item) =>
         matchesCurrentHeadRef(
           currentPullRequestApiToListItem(item),
           input.headRef,
           expectedHeadOwner,
-        )
-      ) {
-        return true;
-      }
-      // A cross-fork PR carries the fork owner in its head, so the checkout-owner
-      // gate excludes it even though the PR lives in this base repo. The head sha
-      // is an unambiguous identity, so accept a match on it regardless of owner —
-      // this mirrors the GitLab adapter, which resolves fork MRs without an
-      // owner gate.
-      return input.headSha !== undefined && item.head.sha === input.headSha;
-    });
-    const match =
-      candidates.find((item) => mapGiteaState(item.state) === "open") ??
-      candidates.find(
-        (item) =>
-          mapGiteaState(item.state) !== "open" &&
-          input.headSha !== undefined &&
-          item.head.sha === input.headSha,
-      ) ??
-      null;
+        ) && matchesRepository(item),
+    );
+    candidates.sort(
+      (a, b) =>
+        Number(b.state === "open") - Number(a.state === "open") ||
+        parseOptionalTime(b.updated_at) - parseOptionalTime(a.updated_at) ||
+        b.number - a.number,
+    );
+    const match = candidates[0] ?? null;
+    const last = items.at(-1);
+    if (
+      items.length >= CURRENT_PR_LOOKUP_PAGE_SIZE &&
+      (!match?.updated_at ||
+        !last?.updated_at ||
+        parseOptionalTime(last.updated_at) >= parseOptionalTime(match.updated_at))
+    )
+      throw new ForgeDiscoveryIncompleteError(
+        "Gitea pull request discovery exceeded its recent candidate window",
+      );
     return match ? currentPullRequestApiToListItem(match) : null;
   }
 
@@ -1662,9 +1810,15 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
       cwd: string;
       headRef: string;
       headSha?: string;
+      force?: boolean;
     },
     expectedHeadOwner: string | null,
-  ): Promise<GiteaPrListItem | null> {
+    repoPath: string,
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean,
+    expectedPath: string,
+    endpoint?: import("./forge-service.js").HeadRepositoryEndpoint,
+  ): Promise<{ match: GiteaPrListItem | null; exhausted: boolean }> {
+    let identityReads = 0;
     for (let page = 1; page <= CURRENT_PR_OPEN_LOOKUP_MAX_PAGES; page += 1) {
       const items = await listPullRequestItems({
         cwd: input.cwd,
@@ -1672,17 +1826,35 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
         limit: CURRENT_PR_LOOKUP_PAGE_SIZE,
         page,
       });
-      const match = items.find((item) =>
-        matchesCurrentHeadRef(item, input.headRef, expectedHeadOwner),
-      );
-      if (match) {
-        return match;
+      for (const item of items) {
+        if (!matchesCurrentHeadRef(item, input.headRef, expectedHeadOwner)) continue;
+        const identityKey = JSON.stringify([
+          input.cwd,
+          repoPath,
+          item.index,
+          expectedPath.toLowerCase(),
+          endpoint ?? null,
+        ]);
+        const cached = input.force ? undefined : pullRequestIdentityCache.get(identityKey);
+        if (cached === true) return { match: item, exhausted: false };
+        if (cached === false) continue;
+        if (identityReads >= CURRENT_PR_IDENTITY_READ_LIMIT)
+          return { match: null, exhausted: true };
+        identityReads += 1;
+        const detail = await runJson(
+          ["api", `${repoPath}/pulls/${item.index}`],
+          { cwd: input.cwd },
+          GiteaCurrentPullRequestApiSchema,
+        );
+        const matches = matchesRepository(detail);
+        pullRequestIdentityCache.set(identityKey, matches);
+        if (matches) return { match: { ...item, headSha: detail.head.sha }, exhausted: false };
       }
       if (items.length < CURRENT_PR_LOOKUP_PAGE_SIZE) {
-        return null;
+        return { match: null, exhausted: false };
       }
     }
-    return null;
+    return { match: null, exhausted: true };
   }
 
   async function loadCurrentPullRequestChecks(
@@ -1718,7 +1890,12 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
         combined,
         actionTasks,
       );
-      return applyGiteaChecks(status, combined, actionTasks, actionRequiredRunIds);
+      return applyGiteaChecks(
+        status.headSha ? status : { ...status, headSha: pr.headSha },
+        combined,
+        actionTasks,
+        actionRequiredRunIds,
+      );
     } catch {
       return status;
     }
@@ -2003,6 +2180,12 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
         cwd: input.cwd,
         headRef: input.headRef,
         headSha: input.headSha,
+        headRepositoryOwner: input.headRepositoryOwner,
+        headRepositoryPath: input.headRepositoryPath,
+        headRepositoryEndpoint: input.headRepositoryEndpoint,
+        previousPullRequest: input.previousPullRequest,
+        changeRequestNumber: input.changeRequestNumber,
+        force: input.force,
       });
     },
 
@@ -2325,6 +2508,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     },
 
     invalidate(input: { cwd: string }): void {
+      pullRequestIdentityCache.clear();
       const prefix = `${input.cwd}:`;
       for (const key of currentPrHeadShaCache.keys()) {
         if (key.startsWith(prefix)) {
