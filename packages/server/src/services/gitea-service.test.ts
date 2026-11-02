@@ -2316,6 +2316,39 @@ describe("createGiteaService", () => {
     expect(calls.filter((args) => args[1] === "repos/example-user/sample-repo")).toHaveLength(2);
   });
 
+  it("revalidates the source repository when the forge remote changes", async () => {
+    let host = "first.example";
+    const { service, calls } = makeService(
+      (args) => {
+        if (args[0] === "pr" && args[1] === "list")
+          return ok(JSON.stringify([{ ...OPEN_PR, index: "8", head: "topic" }]));
+        if (args[0] === "api" && args[1].endsWith("/pulls/8")) {
+          const pr = currentPullRequestApi({
+            number: 8,
+            state: "open",
+            headRef: "topic",
+            headSha: "1".repeat(40),
+          });
+          if (host === "second.example") pr.head.repo.full_name = "example-user/foreign";
+          return ok(JSON.stringify(pr));
+        }
+        if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+          return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
+        if (args[0] === "api" && args[1].includes("pulls?state=all")) return ok("[]");
+        if (args[0] === "pr" && args[1] === "8") return ok(JSON.stringify(STATUS_PR_VIEW));
+        if (args[0] === "api" && args[1].includes("/commits/"))
+          return ok(JSON.stringify({ state: "", statuses: [] }));
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      },
+      { resolveRemoteUrl: async () => `https://${host}/example-user/sample-repo.git` },
+    );
+    const input = { cwd: "/repo", headRef: "topic" };
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
+    host = "second.example";
+    expect(await service.getCurrentPullRequestStatus(input)).toBeNull();
+    expect(calls.filter((args) => args[1]?.endsWith("/pulls/8"))).toHaveLength(2);
+  });
+
   it.each(["open", "merged"] as const)("matches a transferred fork for an %s PR", async (state) => {
     const original = currentPullRequestApi({
       number: 8,

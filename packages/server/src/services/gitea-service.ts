@@ -1868,6 +1868,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     endpoint?: import("./forge-service.js").HeadRepositoryEndpoint,
   ): Promise<{ match: GiteaPrListItem | null; exhausted: boolean }> {
     let identityReads = 0;
+    const remoteUrl = await resolveRemoteUrl(input.cwd);
     for (let page = 1; page <= CURRENT_PR_OPEN_LOOKUP_MAX_PAGES; page += 1) {
       const items = await listPullRequestItems({
         cwd: input.cwd,
@@ -1879,6 +1880,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
         if (!(await matchesHead(item))) continue;
         const identityKey = JSON.stringify([
           input.cwd,
+          remoteUrl,
           repoPath,
           item.index,
           expectedPath.toLowerCase(),
