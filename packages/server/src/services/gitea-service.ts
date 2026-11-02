@@ -1404,6 +1404,10 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
   const now = options.now ?? Date.now;
   const currentPrHeadShaCache = new Map<string, { sha: string; expiresAt: number }>();
   const pullRequestIdentityCache = new LRUCache<string, boolean>({ max: 512, ttl: 120_000 });
+  const canonicalRepositoryPaths = new LRUCache<string, { path: string | null }>({
+    max: 512,
+    ttl: 120_000,
+  });
 
   async function run(args: string[], runOptions: TeaCommandRunnerOptions): Promise<string> {
     const teaPath = await resolveTea();
@@ -1658,7 +1662,27 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     }
     if (!expectedPath) return null;
     const expectedHeadOwner = expectedPath.split("/")[0] ?? null;
-    const matchesRepository = (item: GiteaCurrentPullRequestApi): boolean => {
+    let canonicalLookup: Promise<string | null> | undefined;
+    const loadCanonicalPath = async (): Promise<string | null> => {
+      const key = JSON.stringify([
+        input.cwd,
+        await resolveRemoteUrl(input.cwd),
+        repoPath,
+        expectedPath.toLowerCase(),
+      ]);
+      const cached = input.force ? undefined : canonicalRepositoryPaths.get(key);
+      if (cached !== undefined) return cached.path;
+      const path = expectedPath.split("/").map(encodeURIComponent).join("/");
+      const repository = await runJson(
+        ["api", `repos/${path}`],
+        { cwd: input.cwd },
+        GiteaPullRequestRepoSchema,
+      );
+      const result = repository.full_name ?? null;
+      canonicalRepositoryPaths.set(key, { path: result });
+      return result;
+    };
+    const matchesRepository = async (item: GiteaCurrentPullRequestApi): Promise<boolean> => {
       const headPath =
         item.head.repo?.full_name ??
         (item.head.repo?.id !== undefined &&
@@ -1666,8 +1690,16 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
         repoIdentity
           ? `${repoIdentity.owner}/${repoIdentity.name}`
           : null);
+      if (!headPath) return false;
+      let canonicalPath = expectedPath;
+      if (headPath.toLowerCase() !== expectedPath.toLowerCase()) {
+        canonicalLookup ??= loadCanonicalPath();
+        const resolved = await canonicalLookup;
+        if (!resolved) return false;
+        canonicalPath = resolved;
+      }
       return (
-        headPath?.toLowerCase() === expectedPath.toLowerCase() &&
+        headPath.toLowerCase() === canonicalPath.toLowerCase() &&
         matchesHeadRepositoryEndpoint(input.headRepositoryEndpoint, [
           item.head.repo?.ssh_url,
           item.head.repo?.clone_url,
@@ -1701,7 +1733,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     previousPullRequest?: { number?: number; url: string; state: string } | null;
     expectedHeadOwner: string | null;
     repoPath: string;
-    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean;
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => Promise<boolean>;
     exhausted: boolean;
   }): Promise<GiteaPrListItem | null> {
     let recent: GiteaPrListItem | null;
@@ -1740,7 +1772,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     headRef: string;
     repoPath: string;
     expectedHeadOwner: string | null;
-    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean;
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => Promise<boolean>;
     previousPullRequest?: { number?: number; url: string; state: string } | null;
     recent: GiteaPrListItem | null;
   }): Promise<GiteaPrListItem | null> {
@@ -1763,7 +1795,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     const candidate = currentPullRequestApiToListItem(current);
     return candidate.url === previous.url &&
       matchesCurrentHeadRef(candidate, input.headRef, input.expectedHeadOwner) &&
-      input.matchesRepository(current)
+      (await input.matchesRepository(current))
       ? candidate
       : null;
   }
@@ -1772,7 +1804,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     input: { cwd: string; headRef: string },
     expectedHeadOwner: string | null,
     repoPath: string,
-    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean,
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => Promise<boolean>,
   ): Promise<GiteaPrListItem | null> {
     // tea discovers repository context from any configured git remote, while
     // the default remote resolver reads origin only. Preserve that broader
@@ -1785,14 +1817,18 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
       { cwd: input.cwd },
       GiteaCurrentPullRequestApiSchema,
     );
-    const candidates = items.filter(
-      (item) =>
+    const candidates: GiteaCurrentPullRequestApi[] = [];
+    for (const item of items) {
+      if (
         matchesCurrentHeadRef(
           currentPullRequestApiToListItem(item),
           input.headRef,
           expectedHeadOwner,
-        ) && matchesRepository(item),
-    );
+        ) &&
+        (await matchesRepository(item))
+      )
+        candidates.push(item);
+    }
     candidates.sort(
       (a, b) =>
         Number(b.state === "open") - Number(a.state === "open") ||
@@ -1822,7 +1858,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
     },
     expectedHeadOwner: string | null,
     repoPath: string,
-    matchesRepository: (item: GiteaCurrentPullRequestApi) => boolean,
+    matchesRepository: (item: GiteaCurrentPullRequestApi) => Promise<boolean>,
     expectedPath: string,
     endpoint?: import("./forge-service.js").HeadRepositoryEndpoint,
   ): Promise<{ match: GiteaPrListItem | null; exhausted: boolean }> {
@@ -1854,7 +1890,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
           { cwd: input.cwd },
           GiteaCurrentPullRequestApiSchema,
         );
-        const matches = matchesRepository(detail);
+        const matches = await matchesRepository(detail);
         pullRequestIdentityCache.set(identityKey, matches);
         if (matches) return { match: { ...item, headSha: detail.head.sha }, exhausted: false };
       }
@@ -2517,6 +2553,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
 
     invalidate(input: { cwd: string }): void {
       pullRequestIdentityCache.clear();
+      canonicalRepositoryPaths.clear();
       const prefix = `${input.cwd}:`;
       for (const key of currentPrHeadShaCache.keys()) {
         if (key.startsWith(prefix)) {

@@ -2185,6 +2185,8 @@ describe("createGiteaService", () => {
     foreign.head.repo.id = 2;
     foreign.head.repo.full_name = "example-user/other";
     const { service } = makeService((args) => {
+      if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+        return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
       if (args[0] === "pr" && args[1] === "list") return ok("[]");
       if (args[0] === "api" && args[1].includes("/pulls?state=all"))
         return ok(JSON.stringify([foreign]));
@@ -2193,6 +2195,123 @@ describe("createGiteaService", () => {
     await expect(
       service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "dev" }),
     ).resolves.toBeNull();
+  });
+
+  it.each(["open", "merged"] as const)(
+    "retains a %s PR when its repository was renamed",
+    async (state) => {
+      const original = currentPullRequestApi({
+        number: 8,
+        state: state === "open" ? "open" : "closed",
+        headRef: "topic",
+        headSha: "1".repeat(40),
+        merged: state === "merged",
+      });
+      const pr = {
+        ...original,
+        html_url: "https://gitea.example/acme/renamed/pulls/8",
+        head: {
+          ...original.head,
+          repo: { ...original.head.repo, full_name: "acme/renamed", owner: { login: "acme" } },
+        },
+        base: {
+          ...original.base,
+          repo: { ...original.base.repo, full_name: "acme/renamed", owner: { login: "acme" } },
+        },
+      };
+      const { service, calls } = makeService(
+        (args) => {
+          if (args[0] === "pr" && args[1] === "list")
+            return ok(
+              JSON.stringify(
+                state === "open"
+                  ? [{ ...OPEN_PR, index: "8", head: "topic", url: pr.html_url }]
+                  : [],
+              ),
+            );
+          if (args[0] === "api" && args[1].endsWith("/pulls/8")) return ok(JSON.stringify(pr));
+          if (args[0] === "api" && args[1] === "repos/acme/original")
+            return ok(JSON.stringify({ full_name: "acme/renamed" }));
+          if (args[0] === "api" && args[1].includes("pulls?state=all"))
+            return ok(JSON.stringify([pr]));
+          if (args[0] === "pr" && args[1] === "8") return ok(JSON.stringify(STATUS_PR_VIEW));
+          if (args[0] === "api" && args[1].includes("/commits/"))
+            return ok(JSON.stringify({ state: "", statuses: [] }));
+          throw new Error(`unexpected call: ${args.join(" ")}`);
+        },
+        { resolveRemoteUrl: async () => "https://gitea.example/acme/original.git" },
+      );
+      const input = { cwd: "/repo", headRef: "topic", headRepositoryPath: "acme/original" };
+      expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
+      expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
+      await service.getCurrentPullRequestStatus({ ...input, force: true, reason: "archive" });
+      expect(calls.filter((args) => args[1] === "repos/acme/original")).toHaveLength(2);
+    },
+  );
+
+  it("bounds canonical repository reads when many branch candidates differ", async () => {
+    const other = currentPullRequestApi({
+      number: 1,
+      state: "closed",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+    });
+    other.head.repo.full_name = "example-user/other";
+    const candidates = Array.from({ length: 50 }, (_, i) => ({ ...other, number: i + 1 }));
+    const { service, calls } = makeService((args) => {
+      if (args[0] === "pr" && args[1] === "list") return ok("[]");
+      if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+        return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
+      if (args[0] === "api" && args[1].includes("pulls?state=all"))
+        return ok(JSON.stringify(candidates));
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    });
+    await expect(
+      service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "topic",
+        force: true,
+        reason: "archive",
+      }),
+    ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
+    expect(calls.filter((args) => args[1] === "repos/example-user/sample-repo")).toHaveLength(1);
+  });
+
+  it("isolates renamed repository identities when the forge remote changes", async () => {
+    let host = "first.example";
+    const original = currentPullRequestApi({
+      number: 8,
+      state: "closed",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+      merged: true,
+    });
+    const { service, calls } = makeService(
+      (args) => {
+        if (args[0] === "pr" && args[1] === "list") return ok("[]");
+        if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+          return ok(JSON.stringify({ full_name: `example-user/${host}` }));
+        if (args[0] === "api" && args[1].includes("pulls?state=all"))
+          return ok(
+            JSON.stringify([
+              {
+                ...original,
+                head: {
+                  ...original.head,
+                  repo: { ...original.head.repo, full_name: `example-user/${host}` },
+                },
+              },
+            ]),
+          );
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      },
+      { resolveRemoteUrl: async () => `https://${host}/example-user/sample-repo.git` },
+    );
+    const input = { cwd: "/repo", headRef: "topic" };
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
+    host = "second.example";
+    expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
+    expect(calls.filter((args) => args[1] === "repos/example-user/sample-repo")).toHaveLength(2);
   });
 
   it.each(["merged", "open"] as const)(
@@ -2366,6 +2485,8 @@ describe("createGiteaService", () => {
     foreign.head.repo.id = 2;
     foreign.head.repo.full_name = "example-user/other";
     const { service } = makeService((args) => {
+      if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+        return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
       if (args[0] === "pr" && args[1] === "list")
         return ok(JSON.stringify([{ ...OPEN_PR, head: "dev" }]));
       if (args[0] === "api" && args[1].endsWith("/pulls/5")) return ok(JSON.stringify(foreign));
@@ -2428,6 +2549,8 @@ describe("createGiteaService", () => {
       head: "topic",
     }));
     const { service, calls } = makeService((args) => {
+      if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+        return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
       if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify(candidates));
       if (args[0] === "api" && args[1].includes("pulls?state=all")) return ok("[]");
       if (args[0] === "api" && /\/pulls\/\d+$/.test(args[1])) {
