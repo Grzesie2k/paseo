@@ -2097,6 +2097,30 @@ describe("createGiteaService", () => {
     ]);
   });
 
+  it("discovers the repository from tea when origin and a head path are unavailable", async () => {
+    const pr = currentPullRequestApi({
+      number: 8,
+      state: "closed",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+      merged: true,
+    });
+    const { service } = makeService(
+      (args) => {
+        if (args[0] === "api" && args[1] === "repos/{owner}/{repo}")
+          return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
+        if (args[0] === "pr" && args[1] === "list") return ok("[]");
+        if (args[0] === "api" && args[1].includes("pulls?state=all"))
+          return ok(JSON.stringify([pr]));
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      },
+      { resolveRemoteUrl: async () => null },
+    );
+    expect(
+      (await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "topic" }))?.number,
+    ).toBe(8);
+  });
+
   it("shows a merged PR when the checkout head differs", async () => {
     const stale = currentPullRequestApi({
       number: 8,

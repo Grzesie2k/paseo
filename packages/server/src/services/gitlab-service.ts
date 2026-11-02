@@ -988,22 +988,24 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
   }
 
   async function resolveExpectedHeadProject(
-    cwd: string,
-    headRepositoryPath?: string,
-    headRepositoryOwner?: string,
-    changeRequestNumber?: number,
-    force = false,
+    input: Parameters<ForgeService["getCurrentPullRequestStatus"]>[0],
   ): Promise<string | null> {
-    const remote = await resolveRemoteUrl(cwd);
-    const remotePath = remote ? parseGitRemoteLocation(remote)?.path : null;
-    if (!remotePath) return null;
-    if (headRepositoryPath) return headRepositoryPath;
-    if (!headRepositoryOwner) return remotePath;
-    if (!changeRequestNumber) return null;
-    const hint = await viewMergeRequest(cwd, String(changeRequestNumber));
+    if (input.headRepositoryPath) return input.headRepositoryPath;
+    if (!input.headRepositoryOwner) {
+      const remote = await resolveRemoteUrl(input.cwd);
+      return (
+        (remote ? parseGitRemoteLocation(remote)?.path : null) ??
+        (await readProject(input.cwd, ":fullpath", input.force === true)).path_with_namespace
+      );
+    }
+    if (!input.changeRequestNumber) return null;
+    const hint = await viewMergeRequest(input.cwd, String(input.changeRequestNumber));
     if (hint.source_project_id == null) return null;
-    const path = (await readProject(cwd, hint.source_project_id, force)).path_with_namespace;
-    return path.split("/")[0]?.toLowerCase() === headRepositoryOwner.toLowerCase() ? path : null;
+    const path = (await readProject(input.cwd, hint.source_project_id, input.force === true))
+      .path_with_namespace;
+    return path.split("/")[0]?.toLowerCase() === input.headRepositoryOwner.toLowerCase()
+      ? path
+      : null;
   }
 
   async function readProject(cwd: string, projectId: number | string, force = false) {
@@ -1011,7 +1013,7 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
     const cached = force ? undefined : projectPaths.get(key);
     if (cached) return cached;
     const source = await runJson(
-      ["api", `projects/${encodeURIComponent(projectId)}`],
+      ["api", `projects/${projectId === ":fullpath" ? projectId : encodeURIComponent(projectId)}`],
       { cwd },
       z.object({
         id: z.number().optional(),
@@ -1034,7 +1036,7 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
     const remote = await resolveRemoteUrl(input.cwd);
     const originPath = remote ? parseGitRemoteLocation(remote)?.path : null;
     const targetId =
-      input.expectedPath.toLowerCase() === originPath?.toLowerCase()
+      !originPath || input.expectedPath.toLowerCase() === originPath.toLowerCase()
         ? input.mergeRequests.find(
             (mr) =>
               extractProjectPath(mr.references?.full)?.toLowerCase() ===
@@ -1054,23 +1056,13 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
   }
 
   async function resolveCurrentMergeRequest(
-    cwd: string,
-    headRef: string,
-    headRepositoryPath?: string,
-    headRepositoryOwner?: string,
-    changeRequestNumber?: number,
-    force = false,
-    headRepositoryEndpoint?: import("./forge-service.js").HeadRepositoryEndpoint,
+    input: Parameters<ForgeService["getCurrentPullRequestStatus"]>[0],
   ): Promise<GitLabMergeRequest | null> {
+    const { cwd, headRef, headRepositoryEndpoint } = input;
+    const force = input.force === true;
     const mergeRequests = await listMergeRequestsBySourceBranch(cwd, headRef);
     if (mergeRequests.length === 0) return null;
-    const expectedPath = await resolveExpectedHeadProject(
-      cwd,
-      headRepositoryPath,
-      headRepositoryOwner,
-      changeRequestNumber,
-      force,
-    );
+    const expectedPath = await resolveExpectedHeadProject(input);
     if (!expectedPath) return null;
     const expectedProjectId = await resolveExpectedProjectId({
       cwd,
@@ -1266,15 +1258,7 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
 
     async getCurrentPullRequestStatus(input): Promise<CurrentPullRequestStatus | null> {
       try {
-        const mr = await resolveCurrentMergeRequest(
-          input.cwd,
-          input.headRef,
-          input.headRepositoryPath,
-          input.headRepositoryOwner,
-          input.changeRequestNumber,
-          input.force === true,
-          input.headRepositoryEndpoint,
-        );
+        const mr = await resolveCurrentMergeRequest(input);
         if (!mr) {
           return null;
         }

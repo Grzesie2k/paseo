@@ -18,6 +18,7 @@ import {
 } from "./github-service.js";
 import { isPlatform } from "../test-utils/platform.js";
 import { CheckoutPrStatusResponseSchema } from "@getpaseo/protocol/messages";
+import { ForgeDiscoveryIncompleteError } from "./forge-service.js";
 
 const EXPECTED_GITHUB_FAST_POLL_MS = 20_000;
 const EXPECTED_GITHUB_SLOW_POLL_MS = 120_000;
@@ -1865,6 +1866,82 @@ describe("ForgeService", () => {
       cwd: "/ws-a",
       headRef: "feat-a",
       headRepositoryPath: "fork/renamed",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+    expect(statuses).toEqual([expect.objectContaining({ number: 42, state: "open" })]);
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("uses canonical repository identity for batched polls after a transfer", async () => {
+    const node = batchPollPrNodeJson({
+      state: "OPEN",
+      mergedAt: null,
+      headRepositoryOwner: { login: "new-owner" },
+      headRepository: { name: "repo" },
+    });
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([node], { owner: { login: "new-owner" }, name: "repo" }),
+      }),
+      batchPollStatusJson({ t0: batchPollChecksAliasJson([]) }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "old-owner/repo",
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headRepositoryPath: "old-owner/repo",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+    expect(statuses).toEqual([expect.objectContaining({ number: 42, state: "open" })]);
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("resolves a transferred fork during batched polling", async () => {
+    const node = batchPollPrNodeJson({
+      state: "OPEN",
+      mergedAt: null,
+      headRepositoryOwner: { login: "new-fork" },
+      headRepository: { name: "repo" },
+    });
+    const pr = currentPullRequestJson({
+      url: "https://github.com/base/repo/pull/42",
+      headRefName: "feat-a",
+      headRepositoryOwner: { login: "new-fork" },
+      headRepository: { name: "repo" },
+    });
+    const runner = createScriptedRunner([
+      batchPollStatusJson({ t0: batchPollRepositoryJson([node]) }),
+      pr,
+      JSON.stringify([JSON.parse(pr)]),
+      JSON.stringify({ full_name: "new-fork/repo" }),
+      currentPullRequestGithubFactsJson(),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "base/repo",
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headRepositoryOwner: "old-fork",
+      headRepositoryPath: "old-fork/repo",
       onStatus: (status) => statuses.push(status),
     });
     await vi.advanceTimersByTimeAsync(0);
@@ -3747,10 +3824,60 @@ describe("ForgeService", () => {
       runner: runner.runner,
       resolveGhPath: async () => "/usr/bin/gh",
     });
-    expect(
-      await service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "feature/fork" }),
-    ).toBeNull();
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "feature/fork" }),
+    ).rejects.toBeInstanceOf(ForgeDiscoveryIncompleteError);
     expect(runner.calls.filter((call) => call.args[0] === "api")).toHaveLength(1);
+  });
+
+  it("matches a repository transferred while the checkout retains its old origin URL", async () => {
+    const pr = currentPullRequestJson({
+      url: "https://github.com/new-owner/repo/pull/42",
+      headRepositoryOwner: { login: "new-owner" },
+      headRepository: { name: "repo" },
+    });
+    const runner = createScriptedRunner([
+      pr,
+      JSON.stringify({ owner: { login: "new-owner" }, name: "repo", parent: null }),
+      JSON.stringify([JSON.parse(pr)]),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoSlug: async () => "old-owner/repo",
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "feature/fork",
+        headRepositoryPath: "old-owner/repo",
+      }),
+    ).toMatchObject({ number: 42 });
+  });
+
+  it("matches a transferred fork using its canonical repository identity", async () => {
+    const pr = currentPullRequestJson({
+      url: "https://github.com/base/repo/pull/42",
+      headRepositoryOwner: { login: "new-fork" },
+      headRepository: { name: "repo" },
+    });
+    const runner = createScriptedRunner([
+      pr,
+      JSON.stringify([JSON.parse(pr)]),
+      JSON.stringify({ full_name: "new-fork/repo" }),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+    });
+    expect(
+      await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "feature/fork",
+        headRepositoryOwner: "old-fork",
+        headRepositoryPath: "old-fork/repo",
+      }),
+    ).toMatchObject({ number: 42 });
   });
 
   it("propagates a failed fork PR lookup instead of reporting no pull request", async () => {

@@ -1638,6 +1638,14 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
       (input.headRepositoryOwner
         ? null
         : repoIdentity && `${repoIdentity.owner}/${repoIdentity.name}`);
+    if (!expectedPath && !input.headRepositoryOwner && !repoIdentity) {
+      const repository = await runJson(
+        ["api", "repos/{owner}/{repo}"],
+        { cwd: input.cwd },
+        GiteaPullRequestRepoSchema,
+      );
+      expectedPath = repository.full_name ?? null;
+    }
     if (!expectedPath && input.headRepositoryOwner && input.changeRequestNumber) {
       const hint = await runJson(
         ["api", `${repoPath}/pulls/${input.changeRequestNumber}`],

@@ -262,6 +262,36 @@ const DISCUSSIONS = [
 ];
 
 describe("createGitLabService", () => {
+  it.each([true, false])(
+    "discovers the project without an origin remote (head path supplied: %s)",
+    async (hasHeadPath) => {
+      const mr = { ...OPEN_MR, source_branch: "topic" };
+      const { service } = makeService(
+        (args) => {
+          if (args[1] === "list") return ok(JSON.stringify([mr]));
+          if (args[1] === "view") return ok(JSON.stringify(mr));
+          if (
+            args[1] === "projects/:fullpath" ||
+            args[1] === "projects/example-group%2Fexample-project"
+          )
+            return ok(
+              JSON.stringify({ id: 101, path_with_namespace: "example-group/example-project" }),
+            );
+          return ok("{}");
+        },
+        { resolveRemoteUrl: async () => null },
+      );
+      expect(
+        (
+          await service.getCurrentPullRequestStatus({
+            cwd: "/repo",
+            headRef: "topic",
+            ...(hasHeadPath ? { headRepositoryPath: "example-group/example-project" } : {}),
+          })
+        )?.number,
+      ).toBe(14);
+    },
+  );
   it("requires native clone URL proof for mixed transport ports and isolates cached endpoints", async () => {
     const mr = { ...OPEN_MR, source_branch: "topic" };
     let cloneUrl: string | undefined =

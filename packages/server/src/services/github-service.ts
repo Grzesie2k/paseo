@@ -29,6 +29,7 @@ import {
   normalizeForgeSearchKinds,
   parseOptionalTime,
   matchesHeadRepositoryEndpoint,
+  ForgeDiscoveryIncompleteError,
 } from "./forge-service.js";
 import type {
   CheckAnnotation,
@@ -666,6 +667,7 @@ const BatchPollPrNodeSchema = z.object({
 
 const BatchPollRepositorySchema = z.object({
   owner: z.object({ login: z.string().optional() }).nullable().optional().catch(null),
+  name: z.string().optional(),
   isFork: z.boolean().optional().catch(false),
   parent: z
     .object({ owner: z.object({ login: z.string() }), name: z.string() })
@@ -797,6 +799,7 @@ function buildBatchPullRequestStatusQuery(
     owner {
       login
     }
+    name
     isFork
     parent {
       owner {
@@ -1108,6 +1111,7 @@ interface GitHubBatchPollEntry {
   owner: string;
   name: string;
   headRepositoryOwner?: string;
+  canonicalHeadRepositoryPath?: string;
 }
 
 interface PendingBatchPullRequestChecks {
@@ -1179,7 +1183,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
   const frozenPullRequestChecksCache = new Map<string, unknown[]>();
   const pollRepositoryRedirects = new Map<
     string,
-    { owner: string; name: string; headRepositoryOwner: string }
+    {
+      owner: string;
+      name: string;
+      headRepositoryOwner: string;
+      canonicalHeadRepositoryPath: string;
+    }
   >();
   const pollPausedUntilByHost = new Map<string, number>();
   const rateLimitResetLoads = new Map<string, Promise<number | null>>();
@@ -1754,6 +1763,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
           owner: repository.data.parent.owner.login,
           name: repository.data.parent.name,
           headRepositoryOwner: forkOwner,
+          canonicalHeadRepositoryPath: `${forkOwner}/${repository.data.name ?? entry.originName}`,
         });
         distribution.redirected.push(entry);
         continue;
@@ -1764,8 +1774,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       }
       const node = selectBatchPollNode(entry, repository.data);
       if (!node) {
-        // A fork's PR can live in the parent repository.
-        if (repository.data.isFork) {
+        if (shouldRetryUnmatchedBatch(entry, repository.data)) {
           distribution.legacyFallback.push(entry.target);
         } else {
           finalizeBatchPollTarget({
@@ -1778,10 +1787,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
         }
         continue;
       }
-      const frozenKey =
-        node.state !== "OPEN" && node.headRefOid.length > 0
-          ? `${entry.owner}/${entry.name}#${node.number}@${node.headRefOid}`
-          : null;
+      const frozenKey = frozenPullRequestKey(entry, node);
       const cachedRollup = frozenKey ? frozenPullRequestChecksCache.get(frozenKey) : undefined;
       if (frozenKey && cachedRollup) {
         rememberFrozenPullRequestChecks(frozenKey, cachedRollup);
@@ -1804,6 +1810,24 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     return distribution;
   }
 
+  function shouldRetryUnmatchedBatch(
+    entry: GitHubBatchPollEntry,
+    repository: BatchPollRepository,
+  ): boolean {
+    return Boolean(
+      repository.isFork ||
+      (entry.target.headRepositoryOwner &&
+        entry.target.headRepositoryPath &&
+        repository.pullRequests.nodes.length > 0),
+    );
+  }
+
+  function frozenPullRequestKey(entry: GitHubBatchPollEntry, node: BatchPollPrNode): string | null {
+    return node.state !== "OPEN" && node.headRefOid.length > 0
+      ? `${entry.owner}/${entry.name}#${node.number}@${node.headRefOid}`
+      : null;
+  }
+
   function addressGitHubBatchEntry(entry: GitHubBatchPollEntry): GitHubBatchPollEntry {
     const redirect = pollRepositoryRedirects.get(batchRepositoryRedirectKey(entry));
     return redirect
@@ -1812,6 +1836,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
           owner: redirect.owner,
           name: redirect.name,
           headRepositoryOwner: redirect.headRepositoryOwner,
+          canonicalHeadRepositoryPath: redirect.canonicalHeadRepositoryPath,
         }
       : entry;
   }
@@ -1857,7 +1882,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       headRef: entry.target.headRef,
       headRepositoryOwner,
       headRepositoryPath:
-        entry.target.headRepositoryPath ?? `${entry.originOwner}/${entry.originName}`,
+        !entry.target.headRepositoryOwner &&
+        entry.target.headRepositoryPath?.toLowerCase() ===
+          `${entry.originOwner}/${entry.originName}`.toLowerCase()
+          ? (entry.canonicalHeadRepositoryPath ??
+            `${repository.owner?.login ?? entry.originOwner}/${repository.name ?? entry.originName}`)
+          : (entry.target.headRepositoryPath ?? `${entry.originOwner}/${entry.originName}`),
     });
     return match ? (nodeByCandidate.get(match) ?? null) : null;
   }
@@ -2220,6 +2250,10 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
             headSha: input.headSha,
             headRepositoryOwner: input.headRepositoryOwner,
             headRepositoryPath: input.headRepositoryPath,
+            originRepositoryPath:
+              input.headRepositoryPath && !input.headRepositoryOwner
+                ? await resolveRepoSlugCached(input.cwd)
+                : null,
             changeRequestNumber: input.changeRequestNumber,
             run,
           });
@@ -3035,6 +3069,7 @@ interface CurrentPullRequestLookup {
   headSha?: string;
   headRepositoryOwner?: string;
   headRepositoryPath?: string;
+  originRepositoryPath?: string | null;
   changeRequestNumber?: number;
   run: (args: string[], options: GitHubCommandRunnerOptions) => Promise<string>;
 }
@@ -3087,7 +3122,11 @@ async function resolvePullRequestWithoutOwner(
   const parentOwner = repo?.parent?.owner?.login;
   const parentName = repo?.parent?.name;
   if (!forkOwner || !forkName) return null;
-  const headRepositoryPath = options.headRepositoryPath ?? `${forkOwner}/${forkName}`;
+  const headRepositoryPath =
+    options.headRepositoryPath &&
+    options.headRepositoryPath.toLowerCase() !== options.originRepositoryPath?.toLowerCase()
+      ? options.headRepositoryPath
+      : `${forkOwner}/${forkName}`;
   options = { ...options, headRepositoryPath };
   const expectedOwner = headRepositoryPath.split("/")[0];
   if (!expectedOwner) return null;
@@ -3113,12 +3152,37 @@ async function resolveListedPullRequest(
   if (candidates.length >= BATCH_PR_CANDIDATE_LIMIT && options.headRepositoryPath) {
     return resolveCrowdedPullRequests(options, options.headRepositoryPath);
   }
-  const match = pickPullRequestCandidate({
+  let match = pickPullRequestCandidate({
     candidates: viewMatch ? [viewMatch, ...candidates] : candidates,
     headRef: options.headRef,
     headRepositoryOwner,
     headRepositoryPath: options.headRepositoryPath,
   });
+  if (
+    !match &&
+    options.headRepositoryOwner &&
+    options.headRepositoryPath &&
+    candidates.some((candidate) => isCandidateForHeadRef(candidate, options.headRef))
+  ) {
+    const args = ["api", `repos/${options.headRepositoryPath}`];
+    const stdout = await options.run(args, { cwd: options.cwd });
+    const repository = parseGitHubJsonOutput(
+      stdout,
+      z.object({ full_name: z.string().optional() }),
+      { args, cwd: options.cwd, emptyFallback: "{}" },
+    );
+    if (
+      repository.full_name &&
+      repository.full_name.toLowerCase() !== options.headRepositoryPath.toLowerCase()
+    ) {
+      match = pickPullRequestCandidate({
+        candidates: viewMatch ? [viewMatch, ...candidates] : candidates,
+        headRef: options.headRef,
+        headRepositoryOwner: repository.full_name.split("/")[0],
+        headRepositoryPath: repository.full_name,
+      });
+    }
+  }
   return match?.status ?? null;
 }
 
@@ -3221,7 +3285,10 @@ async function listForkPullRequestNumbers(options: {
         parseOptionalTime(b.updated_at) - parseOptionalTime(a.updated_at) ||
         b.number - a.number,
     );
-  if (refs.length >= FORK_PR_PAGE_SIZE && !matching.some((ref) => ref.state === "open")) return [];
+  if (refs.length >= FORK_PR_PAGE_SIZE && !matching.some((ref) => ref.state === "open"))
+    throw new ForgeDiscoveryIncompleteError(
+      "GitHub pull request discovery exceeded its candidate window",
+    );
   return matching.slice(0, FORK_PR_VIEW_LIMIT).map((ref) => ref.number);
 }
 
