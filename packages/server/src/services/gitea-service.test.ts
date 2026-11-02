@@ -48,6 +48,8 @@ function makeService(responder: Responder, overrides: Partial<CreateGiteaService
       return result;
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("unexpected call:")) {
+        if (args[0] === "api" && args[1] === "repos/example-user/sample-repo")
+          return ok(JSON.stringify({ full_name: "example-user/sample-repo" }));
         return listedDetail(args) ?? Promise.reject(error);
       }
       throw error;
@@ -2312,6 +2314,60 @@ describe("createGiteaService", () => {
     host = "second.example";
     expect((await service.getCurrentPullRequestStatus(input))?.number).toBe(8);
     expect(calls.filter((args) => args[1] === "repos/example-user/sample-repo")).toHaveLength(2);
+  });
+
+  it.each(["open", "merged"] as const)("matches a transferred fork for an %s PR", async (state) => {
+    const original = currentPullRequestApi({
+      number: 8,
+      state: state === "open" ? "open" : "closed",
+      headRef: "topic",
+      headSha: "1".repeat(40),
+      merged: state === "merged",
+    });
+    const pr = {
+      ...original,
+      html_url: "https://gitea.example/base/repo/pulls/8",
+      head: {
+        ...original.head,
+        repo: {
+          ...original.head.repo,
+          id: 2,
+          full_name: "new-owner/repo",
+          owner: { login: "new-owner" },
+        },
+      },
+      base: { ...original.base, repo: { id: 1, owner: { login: "base" } } },
+    };
+    const { service } = makeService(
+      (args) => {
+        if (args[0] === "pr" && args[1] === "list")
+          return ok(
+            JSON.stringify(
+              state === "open"
+                ? [{ ...OPEN_PR, index: "8", head: "new-owner:topic", url: pr.html_url }]
+                : [],
+            ),
+          );
+        if (args[0] === "api" && args[1].endsWith("/pulls/8")) return ok(JSON.stringify(pr));
+        if (args[0] === "api" && args[1] === "repos/old-owner/repo")
+          return ok(JSON.stringify({ full_name: "new-owner/repo" }));
+        if (args[0] === "api" && args[1].includes("pulls?state=all"))
+          return ok(JSON.stringify([pr]));
+        if (args[0] === "pr" && args[1] === "8") return ok(JSON.stringify(STATUS_PR_VIEW));
+        if (args[0] === "api" && args[1].includes("/commits/"))
+          return ok(JSON.stringify({ state: "", statuses: [] }));
+        throw new Error(`unexpected call: ${args.join(" ")}`);
+      },
+      { resolveRemoteUrl: async () => "https://gitea.example/base/repo.git" },
+    );
+    expect(
+      await service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "topic",
+        headRepositoryOwner: "old-owner",
+        headRepositoryPath: "old-owner/repo",
+      }),
+    ).toMatchObject({ number: 8, state });
   });
 
   it.each(["merged", "open"] as const)(

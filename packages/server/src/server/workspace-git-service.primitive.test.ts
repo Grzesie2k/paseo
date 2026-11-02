@@ -1604,7 +1604,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       nowMs = 3_000;
       await service.refresh(REPO_CWD);
 
-      expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest).toBeNull();
+      expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest?.title).toBe("Visible PR");
       expect(forge.getCurrentPullRequestStatus).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(0);
@@ -1613,6 +1613,57 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
       expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest?.title).toBe("MR self-healed");
       subscription.unsubscribe();
+    } finally {
+      service.dispose();
+      unregister();
+    }
+  });
+
+  test("keeps the known open association when a checkout commit changes before forge refresh", async () => {
+    let headSha = "1111111111111111111111111111111111111111";
+    const open = createCurrentPullRequestStatus({
+      number: 2,
+      url: "https://forge-commit.test/acme/repo/pulls/2",
+      state: "open",
+    });
+    const merged = createCurrentPullRequestStatus({
+      number: 1,
+      url: "https://forge-commit.test/acme/repo/pulls/1",
+      state: "merged",
+      isMerged: true,
+    });
+    const forge = { ...createGitHubServiceStub(), retainCurrentPullRequestStatusPoll: undefined };
+    const unregister = defaultForgeRegistry.register("forge-commit-test", {
+      createService: () => forge,
+      matchesHost: (host) => host === "forge-commit.test",
+    });
+    let first = true;
+    const service = createService({
+      getCheckoutSnapshotFacts: vi.fn(async (cwd) =>
+        createCheckoutFacts(cwd, {
+          currentBranch: "feature",
+          remoteUrl: "https://forge-commit.test/acme/repo.git",
+          pullRequestLookupTarget: { headRef: "feature", headSha },
+        }),
+      ),
+      getCheckoutStatus: vi.fn(async (cwd) =>
+        createCheckoutStatus(cwd, {
+          currentBranch: "feature",
+          remoteUrl: "https://forge-commit.test/acme/repo.git",
+        }),
+      ),
+      getPullRequestStatus: vi.fn(async (_cwd, _forge, options) => {
+        const result = first || options.previousPullRequest?.number === 2 ? open : merged;
+        first = false;
+        return { ...createPullRequestStatusResult(), status: result };
+      }),
+    });
+    try {
+      expect((await service.getSnapshot(REPO_CWD)).forge.pullRequest?.number).toBe(2);
+      headSha = "2222222222222222222222222222222222222222";
+      const refreshed = await service.getSnapshot(REPO_CWD, { force: true, reason: "test" });
+      expect(refreshed.git.headSha).toBe(headSha);
+      expect(refreshed.forge.pullRequest).toMatchObject({ number: 2, state: "open" });
     } finally {
       service.dispose();
       unregister();

@@ -3565,7 +3565,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.lastShellOutAtMs = now.getTime();
 
     const cwd = target.cwd;
-    const previousForgePrStatusPollKey = this.getForgePrStatusPollKey(target);
+    const previousForgePrAssociationKey = this.getForgePrAssociationKey(target);
     const baseContext: CheckoutContext = {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -3616,7 +3616,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const loadedAtMs = this.deps.now().getTime();
     target.latestGitLoadedAtMs = loadedAtMs;
 
-    if (previousForgePrStatusPollKey !== this.getForgePrStatusPollKey(target)) {
+    if (previousForgePrAssociationKey !== this.getForgePrAssociationKey(target)) {
       target.latestForge = buildForgeUnavailableSnapshot();
       target.latestForgeLoadedAtMs = target.latestGitLoadedAtMs;
     }
@@ -3682,7 +3682,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     };
   }
 
-  private getForgePrStatusPollKey(target: WorkspaceGitTarget): string | null {
+  private getForgePrAssociationKey(target: WorkspaceGitTarget): string | null {
     const git = target.latestGit;
     if (!git?.currentBranch || !git.remoteUrl) {
       return null;
@@ -3698,7 +3698,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return null;
     }
 
-    return buildWorkspaceForgePrStatusPollKey({
+    return buildWorkspaceForgePrAssociationKey({
       forge: resolution.forge,
       remoteUrl: git.remoteUrl,
       target: pollTarget,
@@ -4190,10 +4190,24 @@ function buildWorkspaceForgePrStatusPollKey({
   target: WorkspaceForgePrStatusPollTarget;
 }): string {
   return JSON.stringify([
+    buildWorkspaceForgePrAssociationKey({ forge, remoteUrl, target }),
+    target.headSha ?? null,
+  ]);
+}
+
+function buildWorkspaceForgePrAssociationKey({
+  forge,
+  remoteUrl,
+  target,
+}: {
+  forge: string;
+  remoteUrl: string;
+  target: WorkspaceForgePrStatusPollTarget;
+}): string {
+  return JSON.stringify([
     forge,
     remoteUrl,
     target.headRef,
-    target.headSha ?? null,
     target.headRepositoryOwner ?? null,
     target.headRepositoryPath ?? null,
     target.headRepositoryHost ?? null,

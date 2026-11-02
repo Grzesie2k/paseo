@@ -84,6 +84,9 @@ export async function typeIntoFocusedComposer(page: Page, text: string): Promise
 }
 
 export async function sendDraftToQueue(page: Page): Promise<void> {
+  await expect(
+    page.getByRole("button", { name: /^(Send and steer|Send and interrupt)$/ }),
+  ).toBeEnabled({ timeout: 30_000 });
   await composerInput(page).press("Control+Enter");
 }
 
